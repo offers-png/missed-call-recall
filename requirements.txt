@@ -3,4 +3,4 @@ uvicorn==0.30.6
 python-multipart==0.0.9
 twilio==9.3.5
 stripe==10.12.0
-supabase==2.7.4
+supabase==2.31.0
