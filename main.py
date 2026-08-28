@@ -26,18 +26,32 @@ import stripe
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("recall")
 
+# Required to boot at all — the app has nothing to do without a database.
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
-TWILIO_SID = os.environ["TWILIO_ACCOUNT_SID"]
-TWILIO_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
-STRIPE_SECRET_KEY = os.environ["STRIPE_SECRET_KEY"]
-STRIPE_WEBHOOK_SECRET = os.environ["STRIPE_WEBHOOK_SECRET"]
-STRIPE_PRICE_ID = os.environ["STRIPE_PRICE_ID"]
+
+# Optional at startup — not configured yet is fine. Endpoints that need these
+# will return a clear 503 instead of crashing the whole server on boot.
+TWILIO_SID = os.environ.get("TWILIO_ACCOUNT_SID")
+TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
+STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID")
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://main-backend-k32m.onrender.com")
 
-stripe.api_key = STRIPE_SECRET_KEY
+stripe.api_key = STRIPE_SECRET_KEY  # fine if None — just can't call Stripe yet
 sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-twilio_client = TwilioClient(TWILIO_SID, TWILIO_TOKEN)
+twilio_client = TwilioClient(TWILIO_SID, TWILIO_TOKEN) if TWILIO_SID and TWILIO_TOKEN else None
+
+
+def require_twilio():
+    if twilio_client is None:
+        raise HTTPException(503, "Twilio isn't configured yet — add TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN.")
+
+
+def require_stripe():
+    if not STRIPE_SECRET_KEY or not STRIPE_PRICE_ID:
+        raise HTTPException(503, "Stripe isn't configured yet — add STRIPE_SECRET_KEY/STRIPE_PRICE_ID.")
 
 app = FastAPI(title="Recall - Missed Call Recovery")
 app.add_middleware(
@@ -68,6 +82,8 @@ async def signup(
     business_phone: str = Form(...),  # their real phone, in E.164 e.g. +13155551234
     area_code: str = Form(None),      # optional preferred area code for the new number
 ):
+    require_twilio()
+    require_stripe()
     existing = sb.table(TABLE_CUST).select("id").eq("email", email).execute()
     if existing.data:
         raise HTTPException(400, "An account with this email already exists.")
@@ -220,6 +236,7 @@ async def twilio_status(request: Request):
 # ---------------------------------------------------------------------------
 @app.post("/stripe/webhook")
 async def stripe_webhook(request: Request):
+    require_stripe()
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature")
     try:
