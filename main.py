@@ -38,6 +38,9 @@ STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
 STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID")
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://main-backend-k32m.onrender.com")
+# The Netlify site where index.html / dashboard.html actually live. This is
+# what customers should land on after paying — the backend has no UI of its own.
+FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "https://glowing-hotteok-00a881.netlify.app")
 
 stripe.api_key = STRIPE_SECRET_KEY  # fine if None — just can't call Stripe yet
 sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -124,8 +127,8 @@ async def signup(
         mode="subscription",
         line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
         subscription_data={"trial_period_days": 7, "metadata": {"customer_id": customer["id"]}},
-        success_url=f"{PUBLIC_BASE_URL}/signup/success?customer_id={customer['id']}",
-        cancel_url=f"{PUBLIC_BASE_URL}/signup/cancelled",
+        success_url=f"{FRONTEND_BASE_URL}/dashboard.html?customer_id={customer['id']}",
+        cancel_url=f"{FRONTEND_BASE_URL}/index.html",
         metadata={"customer_id": customer["id"]},
     )
 
