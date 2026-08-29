@@ -12,10 +12,14 @@ ENV VARS REQUIRED (set these on Render):
   PUBLIC_BASE_URL   e.g. https://main-backend-k32m.onrender.com
 """
 import os
+import hmac
+import hashlib
+import secrets
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
-from fastapi import FastAPI, Request, Form, HTTPException
+import jwt
+from fastapi import FastAPI, Request, Form, HTTPException, Header
 from fastapi.responses import PlainTextResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from twilio.twiml.voice_response import VoiceResponse, Dial
@@ -48,6 +52,49 @@ FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "https://glowing-hotteok
 stripe.api_key = STRIPE_SECRET_KEY  # fine if None — just can't call Stripe yet
 sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 twilio_client = TwilioClient(TWILIO_SID, TWILIO_TOKEN) if TWILIO_SID and TWILIO_TOKEN else None
+
+# Signs login tokens. Falls back to a random value so the app still boots,
+# but that means old sessions/tokens invalidate on every restart until you
+# set a real one — set JWT_SECRET in Render as soon as you can.
+JWT_SECRET = os.environ.get("JWT_SECRET")
+if not JWT_SECRET:
+    JWT_SECRET = secrets.token_hex(32)
+    log.warning("JWT_SECRET not set — using a random per-restart value. Set JWT_SECRET in Render env vars.")
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), 200_000).hex()
+    return f"{salt}${digest}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        salt, digest = stored.split("$")
+        check = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), 200_000).hex()
+        return hmac.compare_digest(check, digest)
+    except Exception:
+        return False
+
+
+def make_token(customer_id: str) -> str:
+    payload = {"customer_id": customer_id, "exp": datetime.now(timezone.utc) + timedelta(days=30)}
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+
+def require_auth(customer_id: str, authorization: str = Header(None)):
+    """Checks the Bearer token in the Authorization header matches this customer_id."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Not logged in.")
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(401, "Session expired — please log in again.")
+    except jwt.InvalidTokenError:
+        raise HTTPException(401, "Invalid session.")
+    if payload.get("customer_id") != customer_id:
+        raise HTTPException(403, "Not authorized for this account.")
 
 
 def require_twilio():
@@ -85,12 +132,15 @@ async def signup(
     business_name: str = Form(...),
     owner_name: str = Form(...),
     email: str = Form(...),
+    password: str = Form(...),
     business_phone: str = Form(...),  # their real phone, in E.164 e.g. +13155551234
     area_code: str = Form(None),      # optional preferred area code for the new number
     reply_template: str = Form(None), # optional custom auto-reply text
 ):
     require_twilio()
     require_stripe()
+    if len(password) < 8:
+        raise HTTPException(400, "Password must be at least 8 characters.")
     existing = sb.table(TABLE_CUST).select("id").eq("email", email).execute()
     if existing.data:
         raise HTTPException(400, "An account with this email already exists.")
@@ -128,6 +178,7 @@ async def signup(
         "business_name": business_name,
         "owner_name": owner_name,
         "email": email,
+        "password_hash": hash_password(password),
         "business_phone": business_phone,
         "twilio_number": purchased.phone_number,
     }
@@ -154,6 +205,7 @@ async def signup(
 
     return {
         "customer_id": customer["id"],
+        "token": make_token(customer["id"]),
         "twilio_number_assigned": purchased.phone_number,
         "checkout_url": checkout.url,
         "instructions": (
@@ -162,6 +214,20 @@ async def signup(
             "to it if you don't have an existing number."
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# LOGIN — email + password, returns a bearer token good for 30 days.
+# ---------------------------------------------------------------------------
+@app.post("/login")
+async def login(email: str = Form(...), password: str = Form(...)):
+    cust = sb.table(TABLE_CUST).select("id, password_hash").eq("email", email).execute()
+    if not cust.data or not cust.data[0].get("password_hash"):
+        raise HTTPException(401, "Incorrect email or password.")
+    customer = cust.data[0]
+    if not verify_password(password, customer["password_hash"]):
+        raise HTTPException(401, "Incorrect email or password.")
+    return {"customer_id": customer["id"], "token": make_token(customer["id"])}
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +375,8 @@ async def stripe_webhook(request: Request):
 MAX_REPLY_LENGTH = 300  # ~2 SMS segments; keeps costs and readability sane
 
 @app.get("/settings/{customer_id}")
-def get_settings(customer_id: str):
+def get_settings(customer_id: str, authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
     cust = sb.table(TABLE_CUST).select(
         "business_name, reply_template"
     ).eq("id", customer_id).execute()
@@ -319,7 +386,8 @@ def get_settings(customer_id: str):
 
 
 @app.post("/settings/{customer_id}")
-async def update_settings(customer_id: str, reply_template: str = Form(...)):
+async def update_settings(customer_id: str, reply_template: str = Form(...), authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
     reply_template = reply_template.strip()
     if not reply_template:
         raise HTTPException(400, "Message can't be empty.")
@@ -341,7 +409,8 @@ async def update_settings(customer_id: str, reply_template: str = Form(...)):
 # customer_id acts as the access token for MVP (fine while trusted/small).
 # ---------------------------------------------------------------------------
 @app.get("/dashboard/{customer_id}")
-def dashboard(customer_id: str):
+def dashboard(customer_id: str, authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
     cust = sb.table(TABLE_CUST).select("*").eq("id", customer_id).execute()
     if not cust.data:
         raise HTTPException(404, "Not found")
