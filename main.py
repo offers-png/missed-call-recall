@@ -37,6 +37,9 @@ TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
 STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID")
+# The approved A2P 10DLC campaign's Messaging Service — new numbers get added
+# to this automatically so texts aren't blocked as unregistered.
+TWILIO_MESSAGING_SERVICE_SID = os.environ.get("TWILIO_MESSAGING_SERVICE_SID", "MGb2dbff5d0714aae51d6c9b5dc42114d0")
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://main-backend-k32m.onrender.com")
 # The Netlify site where index.html / dashboard.html actually live. This is
 # what customers should land on after paying — the backend has no UI of its own.
@@ -109,6 +112,16 @@ async def signup(
         status_callback=f"{PUBLIC_BASE_URL}/twilio/status",
         status_callback_method="POST",
     )
+
+    # Register this number under the approved A2P 10DLC campaign so texts from
+    # it aren't silently blocked by US carriers as "unregistered" (error 30034).
+    if TWILIO_MESSAGING_SERVICE_SID:
+        try:
+            twilio_client.messaging.v1.services(TWILIO_MESSAGING_SERVICE_SID).phone_numbers.create(
+                phone_number_sid=purchased.sid
+            )
+        except Exception as e:
+            log.error(f"Failed to add {purchased.phone_number} to A2P sender pool: {e}")
 
     # 2. Create the customer row (status=trial)
     row = {
