@@ -303,6 +303,40 @@ async def stripe_webhook(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# SETTINGS — lets a customer view/edit their own auto-reply message without
+# re-signing-up. Same customer_id-as-access-token model as the dashboard.
+# ---------------------------------------------------------------------------
+MAX_REPLY_LENGTH = 300  # ~2 SMS segments; keeps costs and readability sane
+
+@app.get("/settings/{customer_id}")
+def get_settings(customer_id: str):
+    cust = sb.table(TABLE_CUST).select(
+        "business_name, reply_template"
+    ).eq("id", customer_id).execute()
+    if not cust.data:
+        raise HTTPException(404, "Not found")
+    return {**cust.data[0], "max_length": MAX_REPLY_LENGTH}
+
+
+@app.post("/settings/{customer_id}")
+async def update_settings(customer_id: str, reply_template: str = Form(...)):
+    reply_template = reply_template.strip()
+    if not reply_template:
+        raise HTTPException(400, "Message can't be empty.")
+    if len(reply_template) > MAX_REPLY_LENGTH:
+        raise HTTPException(
+            400,
+            f"Message is {len(reply_template)} characters — please keep it under {MAX_REPLY_LENGTH} "
+            "(longer messages cost more to send and can arrive as multiple texts)."
+        )
+    cust = sb.table(TABLE_CUST).select("id").eq("id", customer_id).execute()
+    if not cust.data:
+        raise HTTPException(404, "Not found")
+    sb.table(TABLE_CUST).update({"reply_template": reply_template}).eq("id", customer_id).execute()
+    return {"ok": True, "reply_template": reply_template}
+
+
+# ---------------------------------------------------------------------------
 # DASHBOARD API — what the customer sees. Simple, no auth framework yet;
 # customer_id acts as the access token for MVP (fine while trusted/small).
 # ---------------------------------------------------------------------------
