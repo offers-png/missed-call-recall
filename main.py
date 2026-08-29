@@ -19,7 +19,8 @@ import logging
 from datetime import datetime, timezone, timedelta
 
 import jwt
-from fastapi import FastAPI, Request, Form, HTTPException, Header
+import requests
+from fastapi import FastAPI, Request, Form, HTTPException, Header, UploadFile, File
 from fastapi.responses import PlainTextResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from twilio.twiml.voice_response import VoiceResponse, Dial
@@ -41,6 +42,11 @@ TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
 STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID")
+# Separate, higher-priced Stripe price for the Pro (AI voice) tier.
+STRIPE_PRICE_ID_PRO = os.environ.get("STRIPE_PRICE_ID_PRO")
+# ElevenLabs Conversational AI — powers the Pro tier's AI voice receptionist.
+ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
+ELEVENLABS_BASE = "https://api.elevenlabs.io/v1"
 # The approved A2P 10DLC campaign's Messaging Service — new numbers get added
 # to this automatically so texts aren't blocked as unregistered.
 TWILIO_MESSAGING_SERVICE_SID = os.environ.get("TWILIO_MESSAGING_SERVICE_SID", "MGb2dbff5d0714aae51d6c9b5dc42114d0")
@@ -106,6 +112,15 @@ def require_stripe():
     if not STRIPE_SECRET_KEY or not STRIPE_PRICE_ID:
         raise HTTPException(503, "Stripe isn't configured yet — add STRIPE_SECRET_KEY/STRIPE_PRICE_ID.")
 
+
+def require_elevenlabs():
+    if not ELEVENLABS_API_KEY:
+        raise HTTPException(503, "ElevenLabs isn't configured yet — add ELEVENLABS_API_KEY.")
+
+
+def el_headers():
+    return {"xi-api-key": ELEVENLABS_API_KEY}
+
 app = FastAPI(title="Recall - Missed Call Recovery")
 app.add_middleware(
     CORSMiddleware,
@@ -134,11 +149,17 @@ async def signup(
     email: str = Form(...),
     password: str = Form(...),
     business_phone: str = Form(...),  # their real phone, in E.164 e.g. +13155551234
+    tier: str = Form("basic"),        # "basic" or "pro"
     area_code: str = Form(None),      # optional preferred area code for the new number
     reply_template: str = Form(None), # optional custom auto-reply text
 ):
     require_twilio()
     require_stripe()
+    if tier not in ("basic", "pro"):
+        raise HTTPException(400, "tier must be 'basic' or 'pro'.")
+    price_id = STRIPE_PRICE_ID_PRO if tier == "pro" else STRIPE_PRICE_ID
+    if tier == "pro" and not price_id:
+        raise HTTPException(503, "Pro tier isn't configured yet — add STRIPE_PRICE_ID_PRO.")
     if len(password) < 8:
         raise HTTPException(400, "Password must be at least 8 characters.")
     existing = sb.table(TABLE_CUST).select("id").eq("email", email).execute()
@@ -181,6 +202,7 @@ async def signup(
         "password_hash": hash_password(password),
         "business_phone": business_phone,
         "twilio_number": purchased.phone_number,
+        "tier": tier,
     }
     if reply_template and reply_template.strip():
         row["reply_template"] = reply_template.strip()
@@ -192,7 +214,7 @@ async def signup(
     checkout = stripe.checkout.Session.create(
         customer=stripe_customer.id,
         mode="subscription",
-        line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+        line_items=[{"price": price_id, "quantity": 1}],
         subscription_data={"trial_period_days": 7, "metadata": {"customer_id": customer["id"]}},
         success_url=f"{FRONTEND_BASE_URL}/dashboard.html?customer_id={customer['id']}",
         cancel_url=f"{FRONTEND_BASE_URL}/index.html",
@@ -431,8 +453,159 @@ def dashboard(customer_id: str, authorization: str = Header(None)):
     return {
         "business_name": customer["business_name"],
         "status": customer["status"],
+        "tier": customer.get("tier", "basic"),
         "twilio_number": customer["twilio_number"],
         "trial_ends_at": customer["trial_ends_at"],
         "stats": {"missed_calls_recent": total, "auto_texts_sent": texted},
         "recent_calls": calls.data,
     }
+
+
+# ---------------------------------------------------------------------------
+# AI VOICE AGENT (Pro tier) — pick a voice, upload a PDF knowledge base, and
+# wire the customer's Twilio number to an ElevenLabs Conversational AI agent.
+# ---------------------------------------------------------------------------
+@app.get("/voices")
+def list_voices():
+    require_elevenlabs()
+    resp = requests.get(f"{ELEVENLABS_BASE}/voices", headers=el_headers(), timeout=20)
+    if not resp.ok:
+        raise HTTPException(502, f"Couldn't fetch voices from ElevenLabs: {resp.text[:200]}")
+    voices = resp.json().get("voices", [])
+    return [
+        {"voice_id": v["voice_id"], "name": v["name"], "preview_url": v.get("preview_url")}
+        for v in voices
+    ]
+
+
+@app.get("/agent/{customer_id}")
+def get_agent(customer_id: str, authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    cust = sb.table(TABLE_CUST).select(
+        "tier, elevenlabs_agent_id, elevenlabs_voice_id, elevenlabs_kb_doc_id"
+    ).eq("id", customer_id).execute()
+    if not cust.data:
+        raise HTTPException(404, "Not found")
+    row = cust.data[0]
+    if row["tier"] != "pro":
+        raise HTTPException(403, "This account isn't on the Pro tier.")
+    return {
+        "voice_id": row.get("elevenlabs_voice_id"),
+        "has_pdf": bool(row.get("elevenlabs_kb_doc_id")),
+        "agent_configured": bool(row.get("elevenlabs_agent_id")),
+    }
+
+
+@app.post("/agent/{customer_id}/setup")
+async def setup_agent(
+    customer_id: str,
+    voice_id: str = Form(...),
+    pdf: UploadFile = File(None),
+    authorization: str = Header(None),
+):
+    require_auth(customer_id, authorization)
+    require_elevenlabs()
+    require_twilio()
+
+    cust = sb.table(TABLE_CUST).select("*").eq("id", customer_id).execute()
+    if not cust.data:
+        raise HTTPException(404, "Not found")
+    customer = cust.data[0]
+    if customer["tier"] != "pro":
+        raise HTTPException(403, "This account isn't on the Pro tier — upgrade to use the AI voice agent.")
+
+    update = {"elevenlabs_voice_id": voice_id}
+
+    # 1. Upload the PDF as a knowledge base document, if one was provided.
+    kb_doc_id = customer.get("elevenlabs_kb_doc_id")
+    if pdf is not None:
+        files = {"file": (pdf.filename, await pdf.read(), pdf.content_type or "application/pdf")}
+        resp = requests.post(
+            f"{ELEVENLABS_BASE}/convai/knowledge-base/file",
+            headers=el_headers(),
+            files=files,
+            data={"name": f"{customer['business_name']} info"},
+            timeout=60,
+        )
+        if not resp.ok:
+            raise HTTPException(502, f"Couldn't upload PDF to ElevenLabs: {resp.text[:300]}")
+        kb_doc_id = resp.json().get("id")
+        update["elevenlabs_kb_doc_id"] = kb_doc_id
+
+    # 2. Create or update the ElevenLabs agent for this business.
+    system_prompt = (
+        f"You are the phone receptionist for {customer['business_name']}. "
+        "Be friendly, concise, and helpful. Answer questions using the knowledge base "
+        "provided. If you don't know something, offer to have someone call the customer back."
+    )
+    conversation_config = {
+        "agent": {
+            "first_message": f"Hi, thanks for calling {customer['business_name']}! How can I help you today?",
+            "language": "en",
+            "prompt": {"prompt": system_prompt, "llm": "gemini-2.0-flash", "temperature": 0.5},
+        },
+        "tts": {"voice_id": voice_id},
+    }
+    if kb_doc_id:
+        conversation_config["agent"]["prompt"]["knowledge_base"] = [
+            {"id": kb_doc_id, "type": "file", "name": f"{customer['business_name']} info"}
+        ]
+
+    agent_id = customer.get("elevenlabs_agent_id")
+    if agent_id:
+        resp = requests.patch(
+            f"{ELEVENLABS_BASE}/convai/agents/{agent_id}",
+            headers={**el_headers(), "Content-Type": "application/json"},
+            json={"conversation_config": conversation_config},
+            timeout=30,
+        )
+        if not resp.ok:
+            raise HTTPException(502, f"Couldn't update ElevenLabs agent: {resp.text[:300]}")
+    else:
+        resp = requests.post(
+            f"{ELEVENLABS_BASE}/convai/agents/create",
+            headers={**el_headers(), "Content-Type": "application/json"},
+            json={"name": customer["business_name"], "conversation_config": conversation_config},
+            timeout=30,
+        )
+        if not resp.ok:
+            raise HTTPException(502, f"Couldn't create ElevenLabs agent: {resp.text[:300]}")
+        agent_id = resp.json().get("agent_id")
+        update["elevenlabs_agent_id"] = agent_id
+
+    # 3. Import the Twilio number into ElevenLabs (first time only) and assign the agent.
+    phone_id = customer.get("elevenlabs_phone_id")
+    if not phone_id:
+        resp = requests.post(
+            f"{ELEVENLABS_BASE}/convai/phone-numbers",
+            headers={**el_headers(), "Content-Type": "application/json"},
+            json={
+                "provider": "twilio",
+                "phone_number": customer["twilio_number"],
+                "label": customer["business_name"],
+                "sid": TWILIO_SID,
+                "token": TWILIO_TOKEN,
+            },
+            timeout=30,
+        )
+        if not resp.ok:
+            raise HTTPException(
+                502,
+                f"Couldn't import your number into ElevenLabs: {resp.text[:300]} "
+                "(this is a newer integration — if this keeps failing, send this exact "
+                "message and we'll fix the field names)."
+            )
+        phone_id = resp.json().get("phone_number_id")
+        update["elevenlabs_phone_id"] = phone_id
+
+    resp = requests.patch(
+        f"{ELEVENLABS_BASE}/convai/phone-numbers/{phone_id}",
+        headers={**el_headers(), "Content-Type": "application/json"},
+        json={"agent_id": agent_id},
+        timeout=30,
+    )
+    if not resp.ok:
+        raise HTTPException(502, f"Couldn't assign the agent to your number: {resp.text[:300]}")
+
+    sb.table(TABLE_CUST).update(update).eq("id", customer_id).execute()
+    return {"ok": True, "agent_id": agent_id, "voice_id": voice_id, "has_pdf": bool(kb_doc_id)}
