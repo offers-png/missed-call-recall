@@ -84,6 +84,7 @@ async def signup(
     email: str = Form(...),
     business_phone: str = Form(...),  # their real phone, in E.164 e.g. +13155551234
     area_code: str = Form(None),      # optional preferred area code for the new number
+    reply_template: str = Form(None), # optional custom auto-reply text
 ):
     require_twilio()
     require_stripe()
@@ -117,6 +118,8 @@ async def signup(
         "business_phone": business_phone,
         "twilio_number": purchased.phone_number,
     }
+    if reply_template and reply_template.strip():
+        row["reply_template"] = reply_template.strip()
     result = sb.table(TABLE_CUST).insert(row).execute()
     customer = result.data[0]
 
