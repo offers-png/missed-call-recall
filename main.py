@@ -482,7 +482,7 @@ def list_voices():
 def get_agent(customer_id: str, authorization: str = Header(None)):
     require_auth(customer_id, authorization)
     cust = sb.table(TABLE_CUST).select(
-        "tier, elevenlabs_agent_id, elevenlabs_voice_id, elevenlabs_kb_doc_id"
+        "tier, elevenlabs_agent_id, elevenlabs_voice_id, elevenlabs_kb_doc_id, fallback_behavior"
     ).eq("id", customer_id).execute()
     if not cust.data:
         raise HTTPException(404, "Not found")
@@ -493,6 +493,7 @@ def get_agent(customer_id: str, authorization: str = Header(None)):
         "voice_id": row.get("elevenlabs_voice_id"),
         "has_pdf": bool(row.get("elevenlabs_kb_doc_id")),
         "agent_configured": bool(row.get("elevenlabs_agent_id")),
+        "fallback_behavior": row.get("fallback_behavior", "message"),
     }
 
 
@@ -500,12 +501,16 @@ def get_agent(customer_id: str, authorization: str = Header(None)):
 async def setup_agent(
     customer_id: str,
     voice_id: str = Form(...),
+    fallback_behavior: str = Form("message"),  # "message" | "transfer" | "try_harder"
     pdf: UploadFile = File(None),
     authorization: str = Header(None),
 ):
     require_auth(customer_id, authorization)
     require_elevenlabs()
     require_twilio()
+
+    if fallback_behavior not in ("message", "transfer", "try_harder"):
+        raise HTTPException(400, "fallback_behavior must be 'message', 'transfer', or 'try_harder'.")
 
     cust = sb.table(TABLE_CUST).select("*").eq("id", customer_id).execute()
     if not cust.data:
@@ -514,7 +519,7 @@ async def setup_agent(
     if customer["tier"] != "pro":
         raise HTTPException(403, "This account isn't on the Pro tier — upgrade to use the AI voice agent.")
 
-    update = {"elevenlabs_voice_id": voice_id}
+    update = {"elevenlabs_voice_id": voice_id, "fallback_behavior": fallback_behavior}
 
     # 1. Upload the PDF as a knowledge base document, if one was provided.
     kb_doc_id = customer.get("elevenlabs_kb_doc_id")
@@ -533,10 +538,15 @@ async def setup_agent(
         update["elevenlabs_kb_doc_id"] = kb_doc_id
 
     # 2. Create or update the ElevenLabs agent for this business.
+    fallback_instructions = {
+        "message": "If you don't know the answer, politely ask for their name and phone number so someone can call them back — don't guess.",
+        "transfer": f"If you don't know the answer, tell the caller you're transferring them to a team member, then use the transfer tool to connect them to {customer['business_phone']}.",
+        "try_harder": "Check the knowledge base carefully before giving up — rephrase the question in your head and look again. Only if you're truly certain the answer isn't in the knowledge base, ask for their name and number for a callback.",
+    }
     system_prompt = (
         f"You are the phone receptionist for {customer['business_name']}. "
-        "Be friendly, concise, and helpful. Answer questions using the knowledge base "
-        "provided. If you don't know something, offer to have someone call the customer back."
+        "Be friendly, concise, and helpful. Answer questions using the knowledge base provided. "
+        + fallback_instructions[fallback_behavior]
     )
     conversation_config = {
         "agent": {
@@ -550,26 +560,47 @@ async def setup_agent(
         conversation_config["agent"]["prompt"]["knowledge_base"] = [
             {"id": kb_doc_id, "type": "file", "name": f"{customer['business_name']} info"}
         ]
+    if fallback_behavior == "transfer":
+        # Best-effort: gives the agent a tool to transfer the live call to the
+        # business's real phone. If ElevenLabs' exact schema for this differs,
+        # the agent still saves fine — it just falls back to verbally telling
+        # the caller to hold, without actually transferring the line yet.
+        conversation_config["agent"]["prompt"]["tools"] = [
+            {
+                "type": "system",
+                "name": "transfer_to_number",
+                "params": {"phone_number": customer["business_phone"]},
+            }
+        ]
+
+    def save_agent(existing_agent_id):
+        if existing_agent_id:
+            r = requests.patch(
+                f"{ELEVENLABS_BASE}/convai/agents/{existing_agent_id}",
+                headers={**el_headers(), "Content-Type": "application/json"},
+                json={"conversation_config": conversation_config},
+                timeout=30,
+            )
+        else:
+            r = requests.post(
+                f"{ELEVENLABS_BASE}/convai/agents/create",
+                headers={**el_headers(), "Content-Type": "application/json"},
+                json={"name": customer["business_name"], "conversation_config": conversation_config},
+                timeout=30,
+            )
+        return r
 
     agent_id = customer.get("elevenlabs_agent_id")
-    if agent_id:
-        resp = requests.patch(
-            f"{ELEVENLABS_BASE}/convai/agents/{agent_id}",
-            headers={**el_headers(), "Content-Type": "application/json"},
-            json={"conversation_config": conversation_config},
-            timeout=30,
-        )
-        if not resp.ok:
-            raise HTTPException(502, f"Couldn't update ElevenLabs agent: {resp.text[:300]}")
-    else:
-        resp = requests.post(
-            f"{ELEVENLABS_BASE}/convai/agents/create",
-            headers={**el_headers(), "Content-Type": "application/json"},
-            json={"name": customer["business_name"], "conversation_config": conversation_config},
-            timeout=30,
-        )
-        if not resp.ok:
-            raise HTTPException(502, f"Couldn't create ElevenLabs agent: {resp.text[:300]}")
+    resp = save_agent(agent_id)
+    if not resp.ok and "tools" in conversation_config["agent"]["prompt"]:
+        # The transfer tool's schema might not match what this ElevenLabs
+        # account expects — drop it and save the rest rather than fail entirely.
+        log.error(f"Agent save with transfer tool failed, retrying without it: {resp.text[:300]}")
+        del conversation_config["agent"]["prompt"]["tools"]
+        resp = save_agent(agent_id)
+    if not resp.ok:
+        raise HTTPException(502, f"Couldn't save ElevenLabs agent: {resp.text[:300]}")
+    if not agent_id:
         agent_id = resp.json().get("agent_id")
         update["elevenlabs_agent_id"] = agent_id
 
