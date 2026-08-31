@@ -867,6 +867,33 @@ def get_calendar_customer(customer_id: str) -> dict:
     return customer
 
 
+@app.get("/debug/check-availability/{customer_id}")
+async def debug_check_availability(customer_id: str, date: str):
+    """TEMPORARY — for diagnosing the calendar tool. Remove once fixed."""
+    import traceback
+    try:
+        customer = get_calendar_customer(customer_id)
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(BUSINESS_TZ)
+        day = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=tz)
+        day_start = day.replace(hour=BUSINESS_HOURS[0], minute=0, second=0, microsecond=0)
+        day_end = day.replace(hour=BUSINESS_HOURS[1], minute=0, second=0, microsecond=0)
+        access_token = google_access_token(customer["google_calendar_refresh_token"])
+        resp = requests.post(
+            "https://www.googleapis.com/calendar/v3/freeBusy",
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            json={"timeMin": day_start.isoformat(), "timeMax": day_end.isoformat(), "items": [{"id": "primary"}]},
+            timeout=20,
+        )
+        return {
+            "step_reached": "freeBusy request sent",
+            "google_status_code": resp.status_code,
+            "google_response_body": resp.text[:1000],
+        }
+    except Exception as e:
+        return {"crashed": True, "error_type": type(e).__name__, "error_message": str(e), "traceback": traceback.format_exc()}
+
+
 @app.post("/tools/check-availability/{customer_id}")
 async def tool_check_availability(customer_id: str, request: Request):
     check_tool_secret({k.lower(): v for k, v in request.headers.items()})
