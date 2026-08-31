@@ -61,15 +61,13 @@ PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://main-backend-k32m.o
 # The Netlify site where index.html / dashboard.html actually live. This is
 # what customers should land on after paying — the backend has no UI of its own.
 FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "https://glowing-hotteok-00a881.netlify.app")
-# Google OAuth — powers Elite tier Calendar booking + Business Profile sync.
-# One app, registered once in Google Cloud; each customer authorizes individually.
-GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
-GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
-GOOGLE_REDIRECT_URI = f"{os.environ.get('PUBLIC_BASE_URL', 'https://missed-call-recall.onrender.com')}/google/callback"
-GOOGLE_SCOPES = {
-    "calendar": "https://www.googleapis.com/auth/calendar",
-    "business": "https://www.googleapis.com/auth/business.manage",
-}
+# Shared secret ElevenLabs sends back on every tool webhook call, so random
+# strangers can't hit these booking endpoints just by guessing the URL.
+ELEVENLABS_TOOL_SECRET = os.environ.get("ELEVENLABS_TOOL_SECRET")
+if not ELEVENLABS_TOOL_SECRET:
+    ELEVENLABS_TOOL_SECRET = secrets.token_hex(24)
+    log.warning("ELEVENLABS_TOOL_SECRET not set — using a random per-restart value. Set it in Render, "
+                "then re-save any Elite customer's AI agent settings so the new secret takes effect.")
 
 stripe.api_key = STRIPE_SECRET_KEY  # fine if None — just can't call Stripe yet
 sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -503,8 +501,8 @@ def get_agent(customer_id: str, authorization: str = Header(None)):
     if not cust.data:
         raise HTTPException(404, "Not found")
     row = cust.data[0]
-    if row["tier"] != "pro":
-        raise HTTPException(403, "This account isn't on the Pro tier.")
+    if row["tier"] not in ("pro", "elite"):
+        raise HTTPException(403, "This account needs the Pro or Elite tier for the AI voice agent.")
     return {
         "voice_id": row.get("elevenlabs_voice_id"),
         "has_pdf": bool(row.get("elevenlabs_kb_doc_id")),
@@ -532,8 +530,8 @@ async def setup_agent(
     if not cust.data:
         raise HTTPException(404, "Not found")
     customer = cust.data[0]
-    if customer["tier"] != "pro":
-        raise HTTPException(403, "This account isn't on the Pro tier — upgrade to use the AI voice agent.")
+    if customer["tier"] not in ("pro", "elite"):
+        raise HTTPException(403, "This account needs the Pro or Elite tier — upgrade to use the AI voice agent.")
 
     update = {"elevenlabs_voice_id": voice_id, "fallback_behavior": fallback_behavior}
 
@@ -564,6 +562,14 @@ async def setup_agent(
         "Be friendly, concise, and helpful. Answer questions using the knowledge base provided. "
         + fallback_instructions[fallback_behavior]
     )
+    calendar_connected = customer.get("tier") == "elite" and customer.get("google_calendar_connected")
+    if calendar_connected:
+        system_prompt += (
+            " You can also book appointments. If the caller wants to schedule something, use the "
+            "check_availability tool to find open times on the date they want, tell them the options, "
+            "then use book_appointment once they confirm a specific date and time. Always get their "
+            "name and callback phone number before booking."
+        )
     conversation_config = {
         "agent": {
             "first_message": f"Hi, thanks for calling {customer['business_name']}! How can I help you today?",
@@ -576,18 +582,64 @@ async def setup_agent(
         conversation_config["agent"]["prompt"]["knowledge_base"] = [
             {"id": kb_doc_id, "type": "file", "name": f"{customer['business_name']} info"}
         ]
+
+    webhook_tools = []
+    if calendar_connected:
+        tool_secret_header = {"X-Tool-Secret": ELEVENLABS_TOOL_SECRET}
+        webhook_tools.extend([
+            {
+                "type": "webhook",
+                "name": "check_availability",
+                "description": "Check the business's calendar for open appointment times on a given date.",
+                "api_schema": {
+                    "url": f"{PUBLIC_BASE_URL}/tools/check-availability/{customer_id}",
+                    "method": "POST",
+                    "request_headers": tool_secret_header,
+                    "request_body_schema": {
+                        "type": "object",
+                        "properties": {
+                            "date": {"type": "string", "description": "Date to check, format YYYY-MM-DD"}
+                        },
+                        "required": ["date"],
+                    },
+                },
+            },
+            {
+                "type": "webhook",
+                "name": "book_appointment",
+                "description": "Book an appointment on the business's calendar once the caller confirms a date and time.",
+                "api_schema": {
+                    "url": f"{PUBLIC_BASE_URL}/tools/book-appointment/{customer_id}",
+                    "method": "POST",
+                    "request_headers": tool_secret_header,
+                    "request_body_schema": {
+                        "type": "object",
+                        "properties": {
+                            "date": {"type": "string", "description": "Date, format YYYY-MM-DD"},
+                            "time": {"type": "string", "description": "24-hour time, format HH:MM"},
+                            "caller_name": {"type": "string", "description": "The caller's name"},
+                            "caller_phone": {"type": "string", "description": "The caller's callback phone number"},
+                        },
+                        "required": ["date", "time", "caller_name", "caller_phone"],
+                    },
+                },
+            },
+        ])
+    if webhook_tools:
+        conversation_config["agent"]["prompt"]["tools"] = webhook_tools
+
     if fallback_behavior == "transfer":
         # Best-effort: gives the agent a tool to transfer the live call to the
         # business's real phone. If ElevenLabs' exact schema for this differs,
         # the agent still saves fine — it just falls back to verbally telling
         # the caller to hold, without actually transferring the line yet.
-        conversation_config["agent"]["prompt"]["tools"] = [
+        conversation_config["agent"]["prompt"].setdefault("tools", []).append(
             {
                 "type": "system",
                 "name": "transfer_to_number",
                 "params": {"phone_number": customer["business_phone"]},
             }
-        ]
+        )
 
     def save_agent(existing_agent_id):
         if existing_agent_id:
@@ -759,3 +811,133 @@ def get_elite_status(customer_id: str, authorization: str = Header(None)):
         "calendar_connected": row.get("google_calendar_connected", False),
         "business_connected": row.get("google_business_connected", False),
     }
+
+
+# ---------------------------------------------------------------------------
+# CALENDAR TOOL ENDPOINTS — called live, mid-call, by the ElevenLabs agent
+# (not by the browser). Protected by a shared secret header instead of the
+# customer's login token, since ElevenLabs' servers are the caller here.
+# Business hours are hardcoded 9am-5pm Eastern for now — a per-customer
+# hours setting is a natural next step, not required for this to work.
+# ---------------------------------------------------------------------------
+BUSINESS_TZ = "America/New_York"
+BUSINESS_HOURS = (9, 17)  # 9am–5pm
+SLOT_MINUTES = 30
+
+
+def check_tool_secret(request_headers: dict):
+    if request_headers.get("x-tool-secret") != ELEVENLABS_TOOL_SECRET:
+        raise HTTPException(401, "Invalid tool secret.")
+
+
+def google_access_token(refresh_token: str) -> str:
+    resp = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        },
+        timeout=20,
+    )
+    if not resp.ok:
+        raise HTTPException(502, f"Couldn't refresh Google access: {resp.text[:200]}")
+    return resp.json()["access_token"]
+
+
+def get_calendar_customer(customer_id: str) -> dict:
+    cust = sb.table(TABLE_CUST).select("*").eq("id", customer_id).execute()
+    if not cust.data:
+        raise HTTPException(404, "Customer not found")
+    customer = cust.data[0]
+    if not customer.get("google_calendar_refresh_token"):
+        raise HTTPException(400, "Google Calendar isn't connected for this business.")
+    return customer
+
+
+@app.post("/tools/check-availability/{customer_id}")
+async def tool_check_availability(customer_id: str, request: Request):
+    check_tool_secret({k.lower(): v for k, v in request.headers.items()})
+    body = await request.json()
+    date_str = body.get("parameters", {}).get("date")
+    if not date_str:
+        return {"result": "I need a specific date (YYYY-MM-DD) to check availability."}
+
+    customer = get_calendar_customer(customer_id)
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(BUSINESS_TZ)
+        day = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=tz)
+        day_start = day.replace(hour=BUSINESS_HOURS[0], minute=0, second=0, microsecond=0)
+        day_end = day.replace(hour=BUSINESS_HOURS[1], minute=0, second=0, microsecond=0)
+    except ValueError:
+        return {"result": "That date didn't look right — please use YYYY-MM-DD format."}
+
+    access_token = google_access_token(customer["google_calendar_refresh_token"])
+    resp = requests.post(
+        "https://www.googleapis.com/calendar/v3/freeBusy",
+        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+        json={
+            "timeMin": day_start.isoformat(),
+            "timeMax": day_end.isoformat(),
+            "items": [{"id": "primary"}],
+        },
+        timeout=20,
+    )
+    if not resp.ok:
+        return {"result": "I couldn't check the calendar right now — please offer to take a message instead."}
+
+    busy = resp.json().get("calendars", {}).get("primary", {}).get("busy", [])
+    busy_ranges = [(datetime.fromisoformat(b["start"]), datetime.fromisoformat(b["end"])) for b in busy]
+
+    free_slots = []
+    slot = day_start
+    while slot + timedelta(minutes=SLOT_MINUTES) <= day_end:
+        slot_end = slot + timedelta(minutes=SLOT_MINUTES)
+        overlaps = any(slot < be and slot_end > bs for bs, be in busy_ranges)
+        if not overlaps:
+            free_slots.append(slot.strftime("%-I:%M %p"))
+        slot = slot_end
+        if len(free_slots) >= 5:
+            break
+
+    if not free_slots:
+        return {"result": f"There's nothing open on {date_str} during business hours — offer another date."}
+    return {"result": f"Available times on {date_str}: " + ", ".join(free_slots)}
+
+
+@app.post("/tools/book-appointment/{customer_id}")
+async def tool_book_appointment(customer_id: str, request: Request):
+    check_tool_secret({k.lower(): v for k, v in request.headers.items()})
+    body = await request.json()
+    p = body.get("parameters", {})
+    date_str, time_str = p.get("date"), p.get("time")
+    caller_name, caller_phone = p.get("caller_name"), p.get("caller_phone")
+    if not all([date_str, time_str, caller_name, caller_phone]):
+        return {"result": "I'm missing some details — I need the date, time, the caller's name, and their phone number."}
+
+    customer = get_calendar_customer(customer_id)
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(BUSINESS_TZ)
+        start = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=tz)
+        end = start + timedelta(minutes=SLOT_MINUTES)
+    except ValueError:
+        return {"result": "That date or time didn't look right — date as YYYY-MM-DD, time as HH:MM."}
+
+    access_token = google_access_token(customer["google_calendar_refresh_token"])
+    resp = requests.post(
+        "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+        json={
+            "summary": f"{caller_name} — {customer['business_name']} appointment",
+            "description": f"Booked by Recall AI. Caller phone: {caller_phone}",
+            "start": {"dateTime": start.isoformat()},
+            "end": {"dateTime": end.isoformat()},
+        },
+        timeout=20,
+    )
+    if not resp.ok:
+        return {"result": "I couldn't book that — please offer to take a message instead."}
+    return {"result": f"Booked for {caller_name} on {date_str} at {time_str}. Confirmed."}
