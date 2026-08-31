@@ -575,7 +575,10 @@ async def setup_agent(
             " You can also book appointments. If the caller wants to schedule something, use the "
             "check_availability tool to find open times on the date they want, tell them the options, "
             "then use book_appointment once they confirm a specific date and time. Always get their "
-            "name and callback phone number before booking."
+            "name and callback phone number before booking. Only tell the caller an appointment is "
+            "confirmed if the book_appointment tool actually returns success — never say it's booked "
+            "if the tool failed or you didn't call it; if that happens, apologize and offer to take a "
+            "message instead."
         )
     conversation_config = {
         "agent": {
@@ -669,9 +672,14 @@ async def setup_agent(
     resp = save_agent(agent_id)
     if not resp.ok and "tools" in conversation_config["agent"]["prompt"]:
         # The transfer tool's schema might not match what this ElevenLabs
-        # account expects — drop it and save the rest rather than fail entirely.
-        log.error(f"Agent save with transfer tool failed, retrying without it: {resp.text[:300]}")
-        del conversation_config["agent"]["prompt"]["tools"]
+        # account expects — drop ONLY that one tool and retry, so calendar
+        # tools (check_availability, book_appointment) survive intact.
+        log.error(f"Agent save failed, retrying with transfer tool removed: {resp.text[:300]}")
+        conversation_config["agent"]["prompt"]["tools"] = [
+            t for t in conversation_config["agent"]["prompt"]["tools"] if t.get("name") != "transfer_to_number"
+        ]
+        if not conversation_config["agent"]["prompt"]["tools"]:
+            del conversation_config["agent"]["prompt"]["tools"]
         resp = save_agent(agent_id)
     if not resp.ok:
         raise HTTPException(502, f"Couldn't save ElevenLabs agent: {resp.text[:300]}")
