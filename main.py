@@ -46,6 +46,11 @@ STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID")
 STRIPE_PRICE_ID_PRO = os.environ.get("STRIPE_PRICE_ID_PRO")
 # ElevenLabs Conversational AI — powers the Pro tier's AI voice receptionist.
 ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
+# The LLM the AI voice agent runs on. ElevenLabs periodically deprecates
+# models — if a "deprecated LLM" warning shows up in their dashboard again,
+# just update this env var in Render (no code change needed) and re-save
+# every affected agent so the new model actually takes effect.
+ELEVENLABS_LLM_MODEL = os.environ.get("ELEVENLABS_LLM_MODEL", "gemini-2.5-flash")
 ELEVENLABS_BASE = "https://api.elevenlabs.io/v1"
 # Google OAuth — powers the Elite tier's Calendar booking + Business Profile sync.
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
@@ -588,7 +593,7 @@ async def setup_agent(
         "agent": {
             "first_message": f"Hi, thanks for calling {customer['business_name']}! How can I help you today?",
             "language": "en",
-            "prompt": {"prompt": system_prompt, "llm": "gemini-2.0-flash", "temperature": 0.5},
+            "prompt": {"prompt": system_prompt, "llm": ELEVENLABS_LLM_MODEL, "temperature": 0.5},
         },
         "tts": {"voice_id": voice_id},
     }
