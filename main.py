@@ -871,6 +871,7 @@ def get_calendar_customer(customer_id: str) -> dict:
 async def tool_check_availability(customer_id: str, request: Request):
     check_tool_secret({k.lower(): v for k, v in request.headers.items()})
     body = await request.json()
+    log.info(f"check-availability request body: {body}")
     date_str = body.get("parameters", {}).get("date")
     if not date_str:
         return {"result": "I need a specific date (YYYY-MM-DD) to check availability."}
@@ -915,14 +916,18 @@ async def tool_check_availability(customer_id: str, request: Request):
             break
 
     if not free_slots:
-        return {"result": f"There's nothing open on {date_str} during business hours — offer another date."}
-    return {"result": f"Available times on {date_str}: " + ", ".join(free_slots)}
+        result = f"There's nothing open on {date_str} during business hours — offer another date."
+    else:
+        result = f"Available times on {date_str}: " + ", ".join(free_slots)
+    log.info(f"check-availability result: {result}")
+    return {"result": result}
 
 
 @app.post("/tools/book-appointment/{customer_id}")
 async def tool_book_appointment(customer_id: str, request: Request):
     check_tool_secret({k.lower(): v for k, v in request.headers.items()})
     body = await request.json()
+    log.info(f"book-appointment request body: {body}")
     p = body.get("parameters", {})
     date_str, time_str = p.get("date"), p.get("time")
     caller_name, caller_phone = p.get("caller_name"), p.get("caller_phone")
@@ -953,4 +958,5 @@ async def tool_book_appointment(customer_id: str, request: Request):
     if not resp.ok:
         log.error(f"Google event creation failed for {customer_id}: {resp.status_code} {resp.text[:400]}")
         return {"result": "I couldn't book that — please offer to take a message instead."}
+    log.info(f"book-appointment success, event id: {resp.json().get('id')}")
     return {"result": f"Booked for {caller_name} on {date_str} at {time_str}. Confirmed."}
