@@ -564,6 +564,13 @@ async def setup_agent(
     )
     calendar_connected = customer.get("tier") == "elite" and customer.get("google_calendar_connected")
     if calendar_connected:
+        from zoneinfo import ZoneInfo
+        today_str = datetime.now(ZoneInfo(BUSINESS_TZ)).strftime("%A, %B %d, %Y")
+        system_prompt += (
+            f" Today's actual date is {today_str}. Always use this as the reference point when the "
+            "caller says things like 'tomorrow', 'next Monday', or 'this Friday' — calculate the real "
+            "calendar date from it rather than guessing."
+        )
         system_prompt += (
             " You can also book appointments. If the caller wants to schedule something, use the "
             "check_availability tool to find open times on the date they want, tell them the options, "
