@@ -857,6 +857,7 @@ def google_access_token(refresh_token: str) -> str:
         timeout=20,
     )
     if not resp.ok:
+        log.error(f"Google token refresh failed: {resp.status_code} {resp.text[:400]}")
         raise HTTPException(502, f"Couldn't refresh Google access: {resp.text[:200]}")
     return resp.json()["access_token"]
 
@@ -901,6 +902,7 @@ async def tool_check_availability(customer_id: str, request: Request):
         timeout=20,
     )
     if not resp.ok:
+        log.error(f"Google freeBusy failed for {customer_id}: {resp.status_code} {resp.text[:400]}")
         return {"result": "I couldn't check the calendar right now — please offer to take a message instead."}
 
     busy = resp.json().get("calendars", {}).get("primary", {}).get("busy", [])
@@ -954,5 +956,6 @@ async def tool_book_appointment(customer_id: str, request: Request):
         timeout=20,
     )
     if not resp.ok:
+        log.error(f"Google event creation failed for {customer_id}: {resp.status_code} {resp.text[:400]}")
         return {"result": "I couldn't book that — please offer to take a message instead."}
     return {"result": f"Booked for {caller_name} on {date_str} at {time_str}. Confirmed."}
