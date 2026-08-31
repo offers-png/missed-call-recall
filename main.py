@@ -876,51 +876,54 @@ async def tool_check_availability(customer_id: str, request: Request):
     if not date_str:
         return {"result": "I need a specific date (YYYY-MM-DD) to check availability."}
 
-    customer = get_calendar_customer(customer_id)
     try:
+        customer = get_calendar_customer(customer_id)
         from zoneinfo import ZoneInfo
         tz = ZoneInfo(BUSINESS_TZ)
         day = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=tz)
         day_start = day.replace(hour=BUSINESS_HOURS[0], minute=0, second=0, microsecond=0)
         day_end = day.replace(hour=BUSINESS_HOURS[1], minute=0, second=0, microsecond=0)
+
+        access_token = google_access_token(customer["google_calendar_refresh_token"])
+        resp = requests.post(
+            "https://www.googleapis.com/calendar/v3/freeBusy",
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            json={
+                "timeMin": day_start.isoformat(),
+                "timeMax": day_end.isoformat(),
+                "items": [{"id": "primary"}],
+            },
+            timeout=20,
+        )
+        if not resp.ok:
+            log.error(f"Google freeBusy failed for {customer_id}: {resp.status_code} {resp.text[:400]}")
+            return {"result": "I couldn't check the calendar right now — please offer to take a message instead."}
+
+        busy = resp.json().get("calendars", {}).get("primary", {}).get("busy", [])
+        busy_ranges = [(datetime.fromisoformat(b["start"]), datetime.fromisoformat(b["end"])) for b in busy]
+
+        free_slots = []
+        slot = day_start
+        while slot + timedelta(minutes=SLOT_MINUTES) <= day_end:
+            slot_end = slot + timedelta(minutes=SLOT_MINUTES)
+            overlaps = any(slot < be and slot_end > bs for bs, be in busy_ranges)
+            if not overlaps:
+                free_slots.append(slot.strftime("%-I:%M %p"))
+            slot = slot_end
+            if len(free_slots) >= 5:
+                break
+
+        if not free_slots:
+            result = f"There's nothing open on {date_str} during business hours — offer another date."
+        else:
+            result = f"Available times on {date_str}: " + ", ".join(free_slots)
+        log.info(f"check-availability result: {result}")
+        return {"result": result}
     except ValueError:
         return {"result": "That date didn't look right — please use YYYY-MM-DD format."}
-
-    access_token = google_access_token(customer["google_calendar_refresh_token"])
-    resp = requests.post(
-        "https://www.googleapis.com/calendar/v3/freeBusy",
-        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-        json={
-            "timeMin": day_start.isoformat(),
-            "timeMax": day_end.isoformat(),
-            "items": [{"id": "primary"}],
-        },
-        timeout=20,
-    )
-    if not resp.ok:
-        log.error(f"Google freeBusy failed for {customer_id}: {resp.status_code} {resp.text[:400]}")
+    except Exception:
+        log.exception(f"check-availability crashed for {customer_id}")
         return {"result": "I couldn't check the calendar right now — please offer to take a message instead."}
-
-    busy = resp.json().get("calendars", {}).get("primary", {}).get("busy", [])
-    busy_ranges = [(datetime.fromisoformat(b["start"]), datetime.fromisoformat(b["end"])) for b in busy]
-
-    free_slots = []
-    slot = day_start
-    while slot + timedelta(minutes=SLOT_MINUTES) <= day_end:
-        slot_end = slot + timedelta(minutes=SLOT_MINUTES)
-        overlaps = any(slot < be and slot_end > bs for bs, be in busy_ranges)
-        if not overlaps:
-            free_slots.append(slot.strftime("%-I:%M %p"))
-        slot = slot_end
-        if len(free_slots) >= 5:
-            break
-
-    if not free_slots:
-        result = f"There's nothing open on {date_str} during business hours — offer another date."
-    else:
-        result = f"Available times on {date_str}: " + ", ".join(free_slots)
-    log.info(f"check-availability result: {result}")
-    return {"result": result}
 
 
 @app.post("/tools/book-appointment/{customer_id}")
@@ -934,29 +937,32 @@ async def tool_book_appointment(customer_id: str, request: Request):
     if not all([date_str, time_str, caller_name, caller_phone]):
         return {"result": "I'm missing some details — I need the date, time, the caller's name, and their phone number."}
 
-    customer = get_calendar_customer(customer_id)
     try:
+        customer = get_calendar_customer(customer_id)
         from zoneinfo import ZoneInfo
         tz = ZoneInfo(BUSINESS_TZ)
         start = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=tz)
         end = start + timedelta(minutes=SLOT_MINUTES)
+
+        access_token = google_access_token(customer["google_calendar_refresh_token"])
+        resp = requests.post(
+            "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            json={
+                "summary": f"{caller_name} — {customer['business_name']} appointment",
+                "description": f"Booked by Recall AI. Caller phone: {caller_phone}",
+                "start": {"dateTime": start.isoformat()},
+                "end": {"dateTime": end.isoformat()},
+            },
+            timeout=20,
+        )
+        if not resp.ok:
+            log.error(f"Google event creation failed for {customer_id}: {resp.status_code} {resp.text[:400]}")
+            return {"result": "I couldn't book that — please offer to take a message instead."}
+        log.info(f"book-appointment success, event id: {resp.json().get('id')}")
+        return {"result": f"Booked for {caller_name} on {date_str} at {time_str}. Confirmed."}
     except ValueError:
         return {"result": "That date or time didn't look right — date as YYYY-MM-DD, time as HH:MM."}
-
-    access_token = google_access_token(customer["google_calendar_refresh_token"])
-    resp = requests.post(
-        "https://www.googleapis.com/calendar/v3/calendars/primary/events",
-        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-        json={
-            "summary": f"{caller_name} — {customer['business_name']} appointment",
-            "description": f"Booked by Recall AI. Caller phone: {caller_phone}",
-            "start": {"dateTime": start.isoformat()},
-            "end": {"dateTime": end.isoformat()},
-        },
-        timeout=20,
-    )
-    if not resp.ok:
-        log.error(f"Google event creation failed for {customer_id}: {resp.status_code} {resp.text[:400]}")
+    except Exception:
+        log.exception(f"book-appointment crashed for {customer_id}")
         return {"result": "I couldn't book that — please offer to take a message instead."}
-    log.info(f"book-appointment success, event id: {resp.json().get('id')}")
-    return {"result": f"Booked for {caller_name} on {date_str} at {time_str}. Confirmed."}
