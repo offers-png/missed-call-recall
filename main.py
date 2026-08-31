@@ -552,9 +552,13 @@ async def setup_agent(
         update["elevenlabs_kb_doc_id"] = kb_doc_id
 
     # 2. Create or update the ElevenLabs agent for this business.
+    # NOTE: "transfer" currently behaves like "message" — the real live-transfer
+    # tool needs ElevenLabs' built_in_tools.transfer_to_number config, which
+    # failed twice with an undocumented schema. Rather than tell the AI it can
+    # transfer when it can't, it takes a message honestly until that's fixed.
     fallback_instructions = {
         "message": "If you don't know the answer, politely ask for their name and phone number so someone can call them back — don't guess.",
-        "transfer": f"If you don't know the answer, tell the caller you're transferring them to a team member, then use the transfer tool to connect them to {customer['business_phone']}.",
+        "transfer": "If you don't know the answer, politely ask for their name and phone number so someone can call them back — don't guess. Do not offer to transfer the call; you don't have that ability.",
         "try_harder": "Check the knowledge base carefully before giving up — rephrase the question in your head and look again. Only if you're truly certain the answer isn't in the knowledge base, ask for their name and number for a callback.",
     }
     system_prompt = (
@@ -638,18 +642,9 @@ async def setup_agent(
     if webhook_tools:
         conversation_config["agent"]["prompt"]["tools"] = webhook_tools
 
-    if fallback_behavior == "transfer":
-        # Best-effort: gives the agent a tool to transfer the live call to the
-        # business's real phone. If ElevenLabs' exact schema for this differs,
-        # the agent still saves fine — it just falls back to verbally telling
-        # the caller to hold, without actually transferring the line yet.
-        conversation_config["agent"]["prompt"].setdefault("tools", []).append(
-            {
-                "type": "system",
-                "name": "transfer_to_number",
-                "params": {"phone_number": customer["business_phone"]},
-            }
-        )
+    # transfer_to_number system tool intentionally not attached — see note
+    # above fallback_instructions. Revisit once the schema is confirmed
+    # against real ElevenLabs docs/testing, not search-result guesses.
 
     def save_agent(existing_agent_id):
         if existing_agent_id:
