@@ -47,6 +47,13 @@ STRIPE_PRICE_ID_PRO = os.environ.get("STRIPE_PRICE_ID_PRO")
 # ElevenLabs Conversational AI — powers the Pro tier's AI voice receptionist.
 ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
 ELEVENLABS_BASE = "https://api.elevenlabs.io/v1"
+# Google OAuth — powers the Elite tier's Calendar booking + Business Profile sync.
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
+GOOGLE_SCOPES = {
+    "calendar": "https://www.googleapis.com/auth/calendar",
+    "business": "https://www.googleapis.com/auth/business.manage",
+}
 # The approved A2P 10DLC campaign's Messaging Service — new numbers get added
 # to this automatically so texts aren't blocked as unregistered.
 TWILIO_MESSAGING_SERVICE_SID = os.environ.get("TWILIO_MESSAGING_SERVICE_SID", "MGb2dbff5d0714aae51d6c9b5dc42114d0")
@@ -54,6 +61,15 @@ PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://main-backend-k32m.o
 # The Netlify site where index.html / dashboard.html actually live. This is
 # what customers should land on after paying — the backend has no UI of its own.
 FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "https://glowing-hotteok-00a881.netlify.app")
+# Google OAuth — powers Elite tier Calendar booking + Business Profile sync.
+# One app, registered once in Google Cloud; each customer authorizes individually.
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
+GOOGLE_REDIRECT_URI = f"{os.environ.get('PUBLIC_BASE_URL', 'https://missed-call-recall.onrender.com')}/google/callback"
+GOOGLE_SCOPES = {
+    "calendar": "https://www.googleapis.com/auth/calendar",
+    "business": "https://www.googleapis.com/auth/business.manage",
+}
 
 stripe.api_key = STRIPE_SECRET_KEY  # fine if None — just can't call Stripe yet
 sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -640,3 +656,106 @@ async def setup_agent(
 
     sb.table(TABLE_CUST).update(update).eq("id", customer_id).execute()
     return {"ok": True, "agent_id": agent_id, "voice_id": voice_id, "has_pdf": bool(kb_doc_id)}
+
+
+# ---------------------------------------------------------------------------
+# GOOGLE OAUTH (Elite tier) — Calendar booking + Business Profile sync.
+# One OAuth app registered under Recall's own Google Cloud project; each
+# customer authorizes their own Google account via the real Google consent
+# screen. We never see or store their Google password — only a refresh token
+# scoped to whichever single permission (calendar or business) they granted.
+# ---------------------------------------------------------------------------
+def require_google():
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        raise HTTPException(503, "Google integration isn't configured yet — add GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET.")
+
+
+def require_elite(customer: dict):
+    if customer.get("tier") != "elite":
+        raise HTTPException(403, "This account isn't on the Elite tier.")
+
+
+@app.get("/google/auth-url")
+def google_auth_url(customer_id: str, service: str, authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    require_google()
+    if service not in GOOGLE_SCOPES:
+        raise HTTPException(400, "service must be 'calendar' or 'business'.")
+
+    cust = sb.table(TABLE_CUST).select("tier").eq("id", customer_id).execute()
+    if not cust.data:
+        raise HTTPException(404, "Not found")
+    require_elite(cust.data[0])
+
+    # Short-lived signed state — carries which customer/service this is for
+    # through Google's redirect, since Google can't send our auth header back.
+    state = jwt.encode(
+        {"customer_id": customer_id, "service": service, "exp": datetime.now(timezone.utc) + timedelta(minutes=10)},
+        JWT_SECRET,
+        algorithm="HS256",
+    )
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": f"{PUBLIC_BASE_URL}/google/callback",
+        "response_type": "code",
+        "scope": GOOGLE_SCOPES[service],
+        "access_type": "offline",
+        "prompt": "consent",
+        "state": state,
+    }
+    from urllib.parse import urlencode
+    return {"url": f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"}
+
+
+@app.get("/google/callback")
+def google_callback(code: str = None, state: str = None, error: str = None):
+    if error:
+        return PlainTextResponse(f"Google sign-in was cancelled or denied ({error}). You can close this tab and try again.")
+    require_google()
+    try:
+        payload = jwt.decode(state, JWT_SECRET, algorithms=["HS256"])
+    except jwt.InvalidTokenError:
+        raise HTTPException(400, "This connection link expired or is invalid — go back and try connecting again.")
+
+    customer_id = payload["customer_id"]
+    service = payload["service"]
+
+    token_resp = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "code": code,
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "redirect_uri": f"{PUBLIC_BASE_URL}/google/callback",
+            "grant_type": "authorization_code",
+        },
+        timeout=20,
+    )
+    if not token_resp.ok:
+        raise HTTPException(502, f"Google didn't accept that authorization: {token_resp.text[:300]}")
+    tokens = token_resp.json()
+    refresh_token = tokens.get("refresh_token")
+
+    if refresh_token:
+        col = "google_calendar_refresh_token" if service == "calendar" else "google_business_refresh_token"
+        flag = "google_calendar_connected" if service == "calendar" else "google_business_connected"
+        sb.table(TABLE_CUST).update({col: refresh_token, flag: True}).eq("id", customer_id).execute()
+
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(f"{FRONTEND_BASE_URL}/elite-setup.html?customer_id={customer_id}&connected={service}")
+
+
+@app.get("/elite/{customer_id}")
+def get_elite_status(customer_id: str, authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    cust = sb.table(TABLE_CUST).select(
+        "tier, google_calendar_connected, google_business_connected"
+    ).eq("id", customer_id).execute()
+    if not cust.data:
+        raise HTTPException(404, "Not found")
+    row = cust.data[0]
+    require_elite(row)
+    return {
+        "calendar_connected": row.get("google_calendar_connected", False),
+        "business_connected": row.get("google_business_connected", False),
+    }
