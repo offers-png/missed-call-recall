@@ -302,6 +302,37 @@ async def twilio_voice(request: Request):
 # DIAL RESULT — fires right after the <Dial> attempt finishes. This is what
 # actually tells us the call went unanswered.
 # ---------------------------------------------------------------------------
+async def send_missed_call_text(to_number: str, caller: str, call_sid: str):
+    """Sends the auto-reply text for a missed call and logs it. Shared by the
+    Basic/Pro <Dial> flow and the Elite AI-agent safety net."""
+    if call_sid:
+        existing = sb.table(TABLE_CALLS).select("id").eq("call_sid", call_sid).execute()
+        if existing.data:
+            return  # already texted for this call — avoid double-sending
+
+    cust = sb.table(TABLE_CUST).select("*").eq("twilio_number", to_number).execute()
+    if not cust.data:
+        return
+    customer = cust.data[0]
+
+    message = customer["reply_template"].replace("{business_name}", customer["business_name"])
+    call_row = {
+        "customer_id": customer["id"],
+        "caller_number": caller,
+        "call_sid": call_sid,
+        "sms_body": message,
+    }
+    try:
+        sms = twilio_client.messages.create(to=caller, from_=to_number, body=message)
+        call_row["sms_sent"] = True
+        call_row["sms_sid"] = sms.sid
+    except Exception as e:
+        log.error(f"SMS send failed for {caller}: {e}")
+        call_row["sms_sent"] = False
+        call_row["sms_error"] = str(e)
+    sb.table(TABLE_CALLS).insert(call_row).execute()
+
+
 @app.post("/twilio/dial-result")
 async def twilio_dial_result(request: Request):
     form = await request.form()
@@ -316,32 +347,7 @@ async def twilio_dial_result(request: Request):
         # Call was answered normally — nothing to do.
         return PlainTextResponse(str(resp), media_type="application/xml")
 
-    cust = sb.table(TABLE_CUST).select("*").eq("twilio_number", to_number).execute()
-    if not cust.data:
-        return PlainTextResponse(str(resp), media_type="application/xml")
-    customer = cust.data[0]
-
-    message = customer["reply_template"].replace("{business_name}", customer["business_name"])
-
-    call_row = {
-        "customer_id": customer["id"],
-        "caller_number": caller,
-        "call_sid": call_sid,
-        "sms_body": message,
-    }
-
-    try:
-        sms = twilio_client.messages.create(
-            to=caller, from_=to_number, body=message
-        )
-        call_row["sms_sent"] = True
-        call_row["sms_sid"] = sms.sid
-    except Exception as e:
-        log.error(f"SMS send failed for {caller}: {e}")
-        call_row["sms_sent"] = False
-        call_row["sms_error"] = str(e)
-
-    sb.table(TABLE_CALLS).insert(call_row).execute()
+    await send_missed_call_text(to_number, caller, call_sid)
 
     resp.say("Sorry we missed you. We've just sent you a text — thanks for calling.")
     resp.hangup()
@@ -350,7 +356,25 @@ async def twilio_dial_result(request: Request):
 
 @app.post("/twilio/status")
 async def twilio_status(request: Request):
-    # Reserved for call-level logging/debugging. Not required for core flow.
+    """Fires on every call to this number regardless of who answered it —
+    Twilio calls this independently of the voice webhook, so it still fires
+    even for Elite/Pro numbers where ElevenLabs owns the voice URL. This is
+    the safety net: if a call ends without being answered (by us OR by the
+    AI), text the caller so nobody falls through the cracks."""
+    form = await request.form()
+    to_number = form.get("To")
+    caller = form.get("From")
+    call_sid = form.get("CallSid")
+    call_status = form.get("CallStatus")  # completed, no-answer, busy, failed
+    duration = int(form.get("CallDuration") or 0)
+
+    # "completed" with a real duration means someone (human or AI) actually
+    # engaged. Anything else — or a suspiciously instant "completed" — means
+    # the caller never got through to anyone.
+    if call_status == "completed" and duration > 3:
+        return PlainTextResponse("", media_type="application/xml")
+
+    await send_missed_call_text(to_number, caller, call_sid)
     return PlainTextResponse("", media_type="application/xml")
 
 
@@ -726,6 +750,19 @@ async def setup_agent(
     )
     if not resp.ok:
         raise HTTPException(502, f"Couldn't assign the agent to your number: {resp.text[:300]}")
+
+    # Re-apply our own status callback on the Twilio number itself — ElevenLabs'
+    # import may have overwritten it. This is what lets send_missed_call_text
+    # fire as a safety net even when ElevenLabs owns the voice webhook.
+    try:
+        numbers = twilio_client.incoming_phone_numbers.list(phone_number=customer["twilio_number"], limit=1)
+        if numbers:
+            numbers[0].update(
+                status_callback=f"{PUBLIC_BASE_URL}/twilio/status",
+                status_callback_method="POST",
+            )
+    except Exception as e:
+        log.error(f"Couldn't re-apply status callback for {customer['twilio_number']}: {e}")
 
     sb.table(TABLE_CUST).update(update).eq("id", customer_id).execute()
     return {"ok": True, "agent_id": agent_id, "voice_id": voice_id, "has_pdf": bool(kb_doc_id)}
