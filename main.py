@@ -51,6 +51,11 @@ ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
 # just update this env var in Render (no code change needed) and re-save
 # every affected agent so the new model actually takes effect.
 ELEVENLABS_LLM_MODEL = os.environ.get("ELEVENLABS_LLM_MODEL", "gemini-3.5-flash")
+# Powers the SMS text-back AI (all tiers) — separate from the ElevenLabs voice
+# AI (Pro/Elite only), since Basic tier has no ElevenLabs setup at all.
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+SMS_HISTORY_LIMIT = 10  # recent messages of context per conversation
 ELEVENLABS_BASE = "https://api.elevenlabs.io/v1"
 # Google OAuth — powers the Elite tier's Calendar booking + Business Profile sync.
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
@@ -201,6 +206,8 @@ async def signup(
         voice_method="POST",
         status_callback=f"{PUBLIC_BASE_URL}/twilio/status",
         status_callback_method="POST",
+        sms_url=f"{PUBLIC_BASE_URL}/twilio/sms",
+        sms_method="POST",
     )
 
     # Register this number under the approved A2P 10DLC campaign so texts from
@@ -502,6 +509,138 @@ def dashboard(customer_id: str, authorization: str = Header(None)):
         "stats": {"missed_calls_recent": total, "auto_texts_sent": texted},
         "recent_calls": calls.data,
     }
+
+
+# ---------------------------------------------------------------------------
+# SMS TEXT-BACK AI (all tiers) — lets a customer reply to the missed-call text
+# and get a real AI answer, grounded in their own uploaded business info.
+# Independent of the ElevenLabs voice AI (Pro/Elite only) since Basic tier
+# has no ElevenLabs setup at all — this uses Claude directly instead.
+# ---------------------------------------------------------------------------
+def require_anthropic():
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(503, "SMS AI isn't configured yet — add ANTHROPIC_API_KEY.")
+
+
+@app.post("/settings/{customer_id}/business-info")
+async def upload_business_info(customer_id: str, pdf: UploadFile = File(...), authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    cust = sb.table(TABLE_CUST).select("id, twilio_number").eq("id", customer_id).execute()
+    if not cust.data:
+        raise HTTPException(404, "Not found")
+    customer = cust.data[0]
+
+    try:
+        import pypdf
+        from io import BytesIO
+        reader = pypdf.PdfReader(BytesIO(await pdf.read()))
+        text = "\n".join(page.extract_text() or "" for page in reader.pages).strip()
+    except Exception as e:
+        raise HTTPException(400, f"Couldn't read that PDF: {e}")
+    if not text:
+        raise HTTPException(400, "Couldn't find any readable text in that PDF.")
+
+    sb.table(TABLE_CUST).update({"business_info_text": text[:20000]}).eq("id", customer_id).execute()
+
+    # Make sure this number can actually receive replies — set the inbound
+    # SMS webhook now in case it wasn't set at signup (e.g. older accounts).
+    if twilio_client and customer.get("twilio_number"):
+        try:
+            numbers = twilio_client.incoming_phone_numbers.list(phone_number=customer["twilio_number"], limit=1)
+            if numbers:
+                numbers[0].update(sms_url=f"{PUBLIC_BASE_URL}/twilio/sms", sms_method="POST")
+        except Exception as e:
+            log.error(f"Couldn't set sms_url for {customer['twilio_number']}: {e}")
+
+    return {"ok": True, "characters_saved": len(text[:20000])}
+
+
+@app.get("/settings/{customer_id}/business-info")
+def get_business_info(customer_id: str, authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    cust = sb.table(TABLE_CUST).select("business_info_text").eq("id", customer_id).execute()
+    if not cust.data:
+        raise HTTPException(404, "Not found")
+    text = cust.data[0].get("business_info_text") or ""
+    return {"has_info": bool(text), "preview": text[:200]}
+
+
+@app.post("/twilio/sms")
+async def twilio_sms(request: Request):
+    require_anthropic()
+    form = await request.form()
+    to_number = form.get("To")
+    from_number = form.get("From")
+    body = (form.get("Body") or "").strip()
+    if not body:
+        return PlainTextResponse("", media_type="application/xml")
+
+    cust = sb.table(TABLE_CUST).select("*").eq("twilio_number", to_number).execute()
+    if not cust.data:
+        return PlainTextResponse("", media_type="application/xml")
+    customer = cust.data[0]
+
+    sb.table("recall_sms_messages").insert({
+        "customer_id": customer["id"], "direction": "inbound",
+        "from_number": from_number, "body": body,
+    }).execute()
+
+    history = (
+        sb.table("recall_sms_messages")
+        .select("direction, body")
+        .eq("customer_id", customer["id"])
+        .order("created_at", desc=True)
+        .limit(SMS_HISTORY_LIMIT)
+        .execute()
+    )
+    turns = list(reversed(history.data))
+
+    business_info = customer.get("business_info_text") or "No business information has been provided yet."
+    system_prompt = (
+        f"You are the text-message assistant for {customer['business_name']}. "
+        "Answer questions using the business info below. Be brief and friendly — "
+        "this is a text message, not a phone call, so keep replies short (under "
+        "400 characters when possible). If you don't know the answer, say so "
+        "honestly and suggest calling the store directly.\n\n"
+        f"Business info:\n{business_info}"
+    )
+    messages = [
+        {"role": "user" if t["direction"] == "inbound" else "assistant", "content": t["body"]}
+        for t in turns
+    ]
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": ANTHROPIC_MODEL,
+                "max_tokens": 300,
+                "system": system_prompt,
+                "messages": messages,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        reply_text = resp.json()["content"][0]["text"].strip()
+    except Exception as e:
+        log.error(f"SMS AI failed for {customer['id']}: {e}")
+        reply_text = "Sorry, I'm having trouble answering right now — please call us directly."
+
+    try:
+        twilio_client.messages.create(to=from_number, from_=to_number, body=reply_text)
+        sb.table("recall_sms_messages").insert({
+            "customer_id": customer["id"], "direction": "outbound",
+            "from_number": to_number, "body": reply_text,
+        }).execute()
+    except Exception as e:
+        log.error(f"SMS AI reply send failed for {customer['id']}: {e}")
+
+    return PlainTextResponse("", media_type="application/xml")
 
 
 # ---------------------------------------------------------------------------
