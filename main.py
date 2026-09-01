@@ -913,7 +913,7 @@ async def tool_check_availability(customer_id: str, request: Request):
         tz = ZoneInfo(BUSINESS_TZ)
         day = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=tz)
         day_start = day.replace(hour=hours_start, minute=0, second=0, microsecond=0)
-        day_end = day.replace(hour=hours_end, minute=0, second=0, microsecond=0)
+        day_end = day_start + timedelta(hours=(hours_end - hours_start))  # handles hours_end=24 (midnight) safely
 
         access_token = google_access_token(customer["google_calendar_refresh_token"])
         resp = requests.post(
@@ -995,7 +995,7 @@ async def tool_book_appointment(customer_id: str, request: Request):
         start = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=tz)
         end = start + timedelta(minutes=SLOT_MINUTES)
         day_start = start.replace(hour=hours_start, minute=0, second=0, microsecond=0)
-        day_end = start.replace(hour=hours_end, minute=0, second=0, microsecond=0)
+        day_end = day_start + timedelta(hours=(hours_end - hours_start))  # handles hours_end=24 (midnight) safely
         if not (day_start <= start and end <= day_end):
             return {"result": f"That time is outside booking hours ({hours_start}:00–{hours_end}:00) — offer a time within that window."}
 
