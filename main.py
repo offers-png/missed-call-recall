@@ -589,7 +589,10 @@ async def setup_agent(
             "have a confirmed date and time, use book_appointment. Always get their name and callback "
             "phone number before booking. Only tell the caller an appointment is confirmed if the "
             "book_appointment tool actually returns success — never say it's booked if the tool failed "
-            "or you didn't call it; if that happens, apologize and offer to take a message instead."
+            "or you didn't call it; if that happens, apologize and offer to take a message instead. "
+            "If a time isn't available, never guess or invent a reason why (like 'it's booked by "
+            "another customer') unless the tool's response actually told you that reason — if you don't "
+            "know why, just say it's not available and offer the alternative times the tool gave you."
         )
     conversation_config = {
         "agent": {
