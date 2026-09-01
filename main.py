@@ -819,7 +819,7 @@ def google_callback(code: str = None, state: str = None, error: str = None):
 def get_elite_status(customer_id: str, authorization: str = Header(None)):
     require_auth(customer_id, authorization)
     cust = sb.table(TABLE_CUST).select(
-        "tier, google_calendar_connected, google_business_connected"
+        "tier, google_calendar_connected, google_business_connected, booking_hours_start, booking_hours_end"
     ).eq("id", customer_id).execute()
     if not cust.data:
         raise HTTPException(404, "Not found")
@@ -828,18 +828,35 @@ def get_elite_status(customer_id: str, authorization: str = Header(None)):
     return {
         "calendar_connected": row.get("google_calendar_connected", False),
         "business_connected": row.get("google_business_connected", False),
+        "booking_hours_start": row.get("booking_hours_start", DEFAULT_BUSINESS_HOURS[0]),
+        "booking_hours_end": row.get("booking_hours_end", DEFAULT_BUSINESS_HOURS[1]),
     }
+
+
+@app.post("/elite/{customer_id}/hours")
+async def update_booking_hours(customer_id: str, hours_start: int = Form(...), hours_end: int = Form(...), authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    if not (0 <= hours_start < hours_end <= 24):
+        raise HTTPException(400, "Hours must be 0-24, and start must be before end.")
+    cust = sb.table(TABLE_CUST).select("tier").eq("id", customer_id).execute()
+    if not cust.data:
+        raise HTTPException(404, "Not found")
+    require_elite(cust.data[0])
+    sb.table(TABLE_CUST).update(
+        {"booking_hours_start": hours_start, "booking_hours_end": hours_end}
+    ).eq("id", customer_id).execute()
+    return {"ok": True, "booking_hours_start": hours_start, "booking_hours_end": hours_end}
 
 
 # ---------------------------------------------------------------------------
 # CALENDAR TOOL ENDPOINTS — called live, mid-call, by the ElevenLabs agent
 # (not by the browser). Protected by a shared secret header instead of the
 # customer's login token, since ElevenLabs' servers are the caller here.
-# Business hours are hardcoded 9am-5pm Eastern for now — a per-customer
-# hours setting is a natural next step, not required for this to work.
+# Fallback default if a customer hasn't set their own hours — actual hours
+# are stored per-customer (booking_hours_start/end) and used below.
 # ---------------------------------------------------------------------------
 BUSINESS_TZ = "America/New_York"
-BUSINESS_HOURS = (9, 17)  # 9am–5pm
+DEFAULT_BUSINESS_HOURS = (9, 17)  # 9am–5pm
 SLOT_MINUTES = 30
 
 
@@ -887,11 +904,13 @@ async def tool_check_availability(customer_id: str, request: Request):
 
     try:
         customer = get_calendar_customer(customer_id)
+        hours_start = customer.get("booking_hours_start", DEFAULT_BUSINESS_HOURS[0])
+        hours_end = customer.get("booking_hours_end", DEFAULT_BUSINESS_HOURS[1])
         from zoneinfo import ZoneInfo
         tz = ZoneInfo(BUSINESS_TZ)
         day = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=tz)
-        day_start = day.replace(hour=BUSINESS_HOURS[0], minute=0, second=0, microsecond=0)
-        day_end = day.replace(hour=BUSINESS_HOURS[1], minute=0, second=0, microsecond=0)
+        day_start = day.replace(hour=hours_start, minute=0, second=0, microsecond=0)
+        day_end = day.replace(hour=hours_end, minute=0, second=0, microsecond=0)
 
         access_token = google_access_token(customer["google_calendar_refresh_token"])
         resp = requests.post(
@@ -966,10 +985,16 @@ async def tool_book_appointment(customer_id: str, request: Request):
 
     try:
         customer = get_calendar_customer(customer_id)
+        hours_start = customer.get("booking_hours_start", DEFAULT_BUSINESS_HOURS[0])
+        hours_end = customer.get("booking_hours_end", DEFAULT_BUSINESS_HOURS[1])
         from zoneinfo import ZoneInfo
         tz = ZoneInfo(BUSINESS_TZ)
         start = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=tz)
         end = start + timedelta(minutes=SLOT_MINUTES)
+        day_start = start.replace(hour=hours_start, minute=0, second=0, microsecond=0)
+        day_end = start.replace(hour=hours_end, minute=0, second=0, microsecond=0)
+        if not (day_start <= start and end <= day_end):
+            return {"result": f"That time is outside booking hours ({hours_start}:00–{hours_end}:00) — offer a time within that window."}
 
         access_token = google_access_token(customer["google_calendar_refresh_token"])
         resp = requests.post(
