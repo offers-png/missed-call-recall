@@ -581,13 +581,15 @@ async def setup_agent(
             "calendar date from it rather than guessing."
         )
         system_prompt += (
-            " You can also book appointments. If the caller wants to schedule something, use the "
-            "check_availability tool to find open times on the date they want, tell them the options, "
-            "then use book_appointment once they confirm a specific date and time. Always get their "
-            "name and callback phone number before booking. Only tell the caller an appointment is "
-            "confirmed if the book_appointment tool actually returns success — never say it's booked "
-            "if the tool failed or you didn't call it; if that happens, apologize and offer to take a "
-            "message instead."
+            " You can also book appointments. If the caller mentions a specific time (like '3pm'), "
+            "always pass that exact time to check_availability so it checks that slot directly — "
+            "never just call check_availability with only the date, since that only returns a few "
+            "early options and can wrongly suggest a free time is taken. If the caller hasn't given a "
+            "time yet, call check_availability with just the date to see general openings. Once you "
+            "have a confirmed date and time, use book_appointment. Always get their name and callback "
+            "phone number before booking. Only tell the caller an appointment is confirmed if the "
+            "book_appointment tool actually returns success — never say it's booked if the tool failed "
+            "or you didn't call it; if that happens, apologize and offer to take a message instead."
         )
     conversation_config = {
         "agent": {
@@ -609,7 +611,7 @@ async def setup_agent(
             {
                 "type": "webhook",
                 "name": "check_availability",
-                "description": "Check the business's calendar for open appointment times on a given date.",
+                "description": "Check whether a specific time is open on a given date. Always pass 'time' when the caller mentions a specific time (e.g. '3pm') so it checks that exact slot — don't omit it and just browse the morning.",
                 "api_schema": {
                     "url": f"{PUBLIC_BASE_URL}/tools/check-availability/{customer_id}",
                     "method": "POST",
@@ -617,7 +619,8 @@ async def setup_agent(
                     "request_body_schema": {
                         "type": "object",
                         "properties": {
-                            "date": {"type": "string", "description": "Date to check, format YYYY-MM-DD"}
+                            "date": {"type": "string", "description": "Date to check, format YYYY-MM-DD"},
+                            "time": {"type": "string", "description": "Optional. 24-hour time HH:MM. Include this whenever the caller mentioned a specific time — checks that exact slot instead of just listing morning openings."},
                         },
                         "required": ["date"],
                     },
@@ -878,6 +881,7 @@ async def tool_check_availability(customer_id: str, request: Request):
     body = await request.json()
     log.info(f"check-availability request body: {body}")
     date_str = body.get("date") or body.get("parameters", {}).get("date")
+    time_str = body.get("time") or body.get("parameters", {}).get("time")  # optional, "HH:MM"
     if not date_str:
         return {"result": "I need a specific date (YYYY-MM-DD) to check availability."}
 
@@ -907,21 +911,39 @@ async def tool_check_availability(customer_id: str, request: Request):
         busy = resp.json().get("calendars", {}).get("primary", {}).get("busy", [])
         busy_ranges = [(datetime.fromisoformat(b["start"]), datetime.fromisoformat(b["end"])) for b in busy]
 
-        free_slots = []
+        def is_free(slot_start):
+            slot_end = slot_start + timedelta(minutes=SLOT_MINUTES)
+            return not any(slot_start < be and slot_end > bs for bs, be in busy_ranges)
+
+        # Build the full list of business-hours slots once, in order.
+        all_slots = []
         slot = day_start
         while slot + timedelta(minutes=SLOT_MINUTES) <= day_end:
-            slot_end = slot + timedelta(minutes=SLOT_MINUTES)
-            overlaps = any(slot < be and slot_end > bs for bs, be in busy_ranges)
-            if not overlaps:
-                free_slots.append(slot.strftime("%-I:%M %p"))
-            slot = slot_end
-            if len(free_slots) >= 5:
-                break
+            all_slots.append(slot)
+            slot += timedelta(minutes=SLOT_MINUTES)
 
-        if not free_slots:
-            result = f"There's nothing open on {date_str} during business hours — offer another date."
+        if time_str:
+            # Caller asked about a SPECIFIC time — check that exact slot first,
+            # rather than only ever looking at the start of the day.
+            try:
+                requested = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=tz)
+            except ValueError:
+                return {"result": "That time didn't look right — please use 24-hour HH:MM format."}
+            if requested in all_slots and is_free(requested):
+                result = f"Yes, {requested.strftime('%-I:%M %p')} on {date_str} is available."
+            else:
+                nearby = [s for s in all_slots if is_free(s)][:5]
+                if nearby:
+                    times_str = ", ".join(s.strftime("%-I:%M %p") for s in nearby)
+                    result = f"{time_str} on {date_str} isn't available. Nearby open times: {times_str}"
+                else:
+                    result = f"There's nothing open on {date_str} during business hours — offer another date."
         else:
-            result = f"Available times on {date_str}: " + ", ".join(free_slots)
+            free_slots = [s.strftime("%-I:%M %p") for s in all_slots if is_free(s)][:5]
+            if not free_slots:
+                result = f"There's nothing open on {date_str} during business hours — offer another date."
+            else:
+                result = f"Available times on {date_str}: " + ", ".join(free_slots)
         log.info(f"check-availability result: {result}")
         return {"result": result}
     except ValueError:
