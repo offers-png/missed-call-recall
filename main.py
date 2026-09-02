@@ -644,6 +644,62 @@ async def twilio_sms(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# APPOINTMENT REMINDERS (Elite tier) — a text sent a set number of minutes
+# before each booked appointment. No background worker runs inside this web
+# service, so this endpoint is meant to be hit on a schedule by an external
+# cron trigger (e.g. cron-job.org, free) every few minutes.
+# ---------------------------------------------------------------------------
+REMINDER_JOB_SECRET = os.environ.get("REMINDER_JOB_SECRET")
+if not REMINDER_JOB_SECRET:
+    REMINDER_JOB_SECRET = secrets.token_hex(24)
+    log.warning("REMINDER_JOB_SECRET not set — using a random per-restart value. Set it in Render.")
+
+
+@app.post("/internal/send-reminders")
+async def send_reminders(request: Request):
+    if request.headers.get("x-job-secret") != REMINDER_JOB_SECRET:
+        raise HTTPException(401, "Invalid job secret.")
+
+    now = datetime.now(timezone.utc)
+    # Pull any not-yet-reminded, still-upcoming appointment — we filter by
+    # each customer's own reminder_minutes_before below, since that varies.
+    due = (
+        sb.table("recall_appointments")
+        .select("*, recall_customers(business_name, reminder_minutes_before, twilio_number)")
+        .eq("reminder_sent", False)
+        .gt("appointment_start", now.isoformat())
+        .execute()
+    )
+
+    sent = 0
+    for appt in due.data:
+        customer = appt.get("recall_customers")
+        if not customer:
+            continue
+        lead_minutes = customer.get("reminder_minutes_before", 60)
+        appt_time = datetime.fromisoformat(appt["appointment_start"])
+        minutes_until = (appt_time - now).total_seconds() / 60
+        if minutes_until > lead_minutes:
+            continue  # not due yet
+
+        local_time = appt_time.strftime("%-I:%M %p")
+        message = (
+            f"Reminder: you have an appointment with {customer['business_name']} "
+            f"today at {local_time}. See you soon!"
+        )
+        try:
+            twilio_client.messages.create(
+                to=appt["caller_phone"], from_=customer["twilio_number"], body=message
+            )
+            sb.table("recall_appointments").update({"reminder_sent": True}).eq("id", appt["id"]).execute()
+            sent += 1
+        except Exception as e:
+            log.error(f"Reminder send failed for appointment {appt['id']}: {e}")
+
+    return {"checked": len(due.data), "reminders_sent": sent}
+
+
+# ---------------------------------------------------------------------------
 # AI VOICE AGENT (Pro tier) — pick a voice, upload a PDF knowledge base, and
 # wire the customer's Twilio number to an ElevenLabs Conversational AI agent.
 # ---------------------------------------------------------------------------
@@ -1191,6 +1247,19 @@ async def tool_book_appointment(customer_id: str, request: Request):
             log.error(f"Google event creation failed for {customer_id}: {resp.status_code} {resp.text[:400]}")
             return {"result": "I couldn't book that — please offer to take a message instead."}
         log.info(f"book-appointment success, event id: {resp.json().get('id')}")
+
+        try:
+            sb.table("recall_appointments").insert({
+                "customer_id": customer_id,
+                "caller_name": caller_name,
+                "caller_phone": caller_phone,
+                "appointment_start": start.isoformat(),
+            }).execute()
+        except Exception as e:
+            # Booking itself already succeeded on the real calendar — don't
+            # fail the whole tool call just because the reminder record failed.
+            log.error(f"Couldn't save appointment record for reminders ({customer_id}): {e}")
+
         return {"result": f"Booked for {caller_name} on {date_str} at {time_str}. Confirmed."}
     except ValueError:
         return {"result": "That date or time didn't look right — date as YYYY-MM-DD, time as HH:MM."}
