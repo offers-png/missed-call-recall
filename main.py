@@ -190,35 +190,48 @@ async def signup(
     if existing.data:
         raise HTTPException(400, "An account with this email already exists.")
 
-    # 1. Buy a dedicated Twilio number for this customer
-    search_kwargs = {"limit": 1}
-    if area_code:
-        search_kwargs["area_code"] = area_code
-    numbers = twilio_client.available_phone_numbers("US").local.list(**search_kwargs)
-    if not numbers:
-        numbers = twilio_client.available_phone_numbers("US").local.list(limit=1)
-    if not numbers:
-        raise HTTPException(500, "No Twilio numbers available right now — try again shortly.")
+    # 1. Get a phone number — prefer an already-warmed one from the pool
+    # (fully registered, no A2P propagation delay) over buying fresh.
+    pooled = get_warmed_number()
+    if pooled:
+        sb.table("recall_number_pool").update({
+            "assigned_to_customer_id": None,  # set to real id after customer row exists, below
+        }).eq("id", pooled["id"]).execute()
 
-    purchased = twilio_client.incoming_phone_numbers.create(
-        phone_number=numbers[0].phone_number,
-        voice_url=f"{PUBLIC_BASE_URL}/twilio/voice",
-        voice_method="POST",
-        status_callback=f"{PUBLIC_BASE_URL}/twilio/status",
-        status_callback_method="POST",
-        sms_url=f"{PUBLIC_BASE_URL}/twilio/sms",
-        sms_method="POST",
-    )
+        class _Purchased:  # shim so the rest of the function can treat this like a fresh purchase
+            phone_number = pooled["phone_number"]
+            sid = pooled["twilio_sid"]
+        purchased = _Purchased()
+    else:
+        log.warning(f"Number pool empty — buying a fresh number for {email}; texts may be delayed by A2P propagation.")
+        search_kwargs = {"limit": 1}
+        if area_code:
+            search_kwargs["area_code"] = area_code
+        numbers = twilio_client.available_phone_numbers("US").local.list(**search_kwargs)
+        if not numbers:
+            numbers = twilio_client.available_phone_numbers("US").local.list(limit=1)
+        if not numbers:
+            raise HTTPException(500, "No Twilio numbers available right now — try again shortly.")
 
-    # Register this number under the approved A2P 10DLC campaign so texts from
-    # it aren't silently blocked by US carriers as "unregistered" (error 30034).
-    if TWILIO_MESSAGING_SERVICE_SID:
-        try:
-            twilio_client.messaging.v1.services(TWILIO_MESSAGING_SERVICE_SID).phone_numbers.create(
-                phone_number_sid=purchased.sid
-            )
-        except Exception as e:
-            log.error(f"Failed to add {purchased.phone_number} to A2P sender pool: {e}")
+        purchased = twilio_client.incoming_phone_numbers.create(
+            phone_number=numbers[0].phone_number,
+            voice_url=f"{PUBLIC_BASE_URL}/twilio/voice",
+            voice_method="POST",
+            status_callback=f"{PUBLIC_BASE_URL}/twilio/status",
+            status_callback_method="POST",
+            sms_url=f"{PUBLIC_BASE_URL}/twilio/sms",
+            sms_method="POST",
+        )
+        # Register this number under the approved A2P 10DLC campaign so texts
+        # from it aren't silently blocked by US carriers (error 30034) — though
+        # since it's fresh, it still needs real propagation time regardless.
+        if TWILIO_MESSAGING_SERVICE_SID:
+            try:
+                twilio_client.messaging.v1.services(TWILIO_MESSAGING_SERVICE_SID).phone_numbers.create(
+                    phone_number_sid=purchased.sid
+                )
+            except Exception as e:
+                log.error(f"Failed to add {purchased.phone_number} to A2P sender pool: {e}")
 
     # 2. Create the customer row (status=trial)
     row = {
@@ -234,6 +247,12 @@ async def signup(
         row["reply_template"] = reply_template.strip()
     result = sb.table(TABLE_CUST).insert(row).execute()
     customer = result.data[0]
+
+    if pooled:
+        sb.table("recall_number_pool").update({
+            "assigned_to_customer_id": customer["id"],
+            "assigned_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", pooled["id"]).execute()
 
     # 3. Create Stripe customer + Checkout session (card required, 7-day trial)
     stripe_customer = stripe.Customer.create(email=email, name=business_name)
@@ -697,6 +716,82 @@ async def send_reminders(request: Request):
             log.error(f"Reminder send failed for appointment {appt['id']}: {e}")
 
     return {"checked": len(due.data), "reminders_sent": sent}
+
+
+# ---------------------------------------------------------------------------
+# NUMBER POOL — keeps a small standing supply of Twilio numbers bought and
+# added to the A2P sender pool WELL BEFORE any customer needs them, since
+# carrier registration propagation can take real hours-to-days. New signups
+# pull an already-warmed number instead of waiting on a fresh one.
+# ---------------------------------------------------------------------------
+NUMBER_POOL_TARGET_SIZE = int(os.environ.get("NUMBER_POOL_TARGET_SIZE", "3"))
+NUMBER_POOL_MIN_WARM_HOURS = int(os.environ.get("NUMBER_POOL_MIN_WARM_HOURS", "24"))
+POOL_JOB_SECRET = os.environ.get("POOL_JOB_SECRET")
+if not POOL_JOB_SECRET:
+    POOL_JOB_SECRET = secrets.token_hex(24)
+    log.warning("POOL_JOB_SECRET not set — using a random per-restart value. Set it in Render.")
+
+
+@app.post("/internal/refill-number-pool")
+async def refill_number_pool(request: Request):
+    if request.headers.get("x-job-secret") != POOL_JOB_SECRET:
+        raise HTTPException(401, "Invalid job secret.")
+    require_twilio()
+
+    available = (
+        sb.table("recall_number_pool").select("id", count="exact")
+        .is_("assigned_to_customer_id", "null").execute()
+    )
+    current_size = available.count or 0
+    to_buy = max(0, NUMBER_POOL_TARGET_SIZE - current_size)
+
+    bought = []
+    for _ in range(to_buy):
+        try:
+            numbers = twilio_client.available_phone_numbers("US").local.list(limit=1)
+            if not numbers:
+                break
+            purchased = twilio_client.incoming_phone_numbers.create(
+                phone_number=numbers[0].phone_number,
+                voice_url=f"{PUBLIC_BASE_URL}/twilio/voice",
+                voice_method="POST",
+                status_callback=f"{PUBLIC_BASE_URL}/twilio/status",
+                status_callback_method="POST",
+                sms_url=f"{PUBLIC_BASE_URL}/twilio/sms",
+                sms_method="POST",
+            )
+            try:
+                twilio_client.messaging.v1.services(TWILIO_MESSAGING_SERVICE_SID).phone_numbers.create(
+                    phone_number_sid=purchased.sid
+                )
+            except Exception as e:
+                log.error(f"Couldn't add pooled number {purchased.phone_number} to A2P sender pool: {e}")
+
+            sb.table("recall_number_pool").insert({
+                "phone_number": purchased.phone_number,
+                "twilio_sid": purchased.sid,
+            }).execute()
+            bought.append(purchased.phone_number)
+        except Exception as e:
+            log.error(f"Number pool refill failed on purchase: {e}")
+            break
+
+    return {"pool_size_before": current_size, "bought": bought, "target": NUMBER_POOL_TARGET_SIZE}
+
+
+def get_warmed_number():
+    """Returns an already-registered spare number from the pool if one has
+    been sitting long enough to be fully propagated with carriers, else None."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=NUMBER_POOL_MIN_WARM_HOURS)).isoformat()
+    result = (
+        sb.table("recall_number_pool").select("*")
+        .is_("assigned_to_customer_id", "null")
+        .lte("added_to_sender_pool_at", cutoff)
+        .order("added_to_sender_pool_at")
+        .limit(1)
+        .execute()
+    )
+    return result.data[0] if result.data else None
 
 
 # ---------------------------------------------------------------------------
