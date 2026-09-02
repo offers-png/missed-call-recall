@@ -1186,10 +1186,12 @@ async def tool_check_availability(customer_id: str, request: Request):
             if requested in all_slots and is_free(requested):
                 result = f"Yes, {requested.strftime('%-I:%M %p')} on {date_str} is available."
             else:
-                nearby = [s for s in all_slots if is_free(s)][:5]
+                free = [s for s in all_slots if is_free(s)]
+                nearby = sorted(free, key=lambda s: abs((s - requested).total_seconds()))[:5]
+                nearby.sort()  # present them in chronological order once selected
                 if nearby:
                     times_str = ", ".join(s.strftime("%-I:%M %p") for s in nearby)
-                    result = f"{time_str} on {date_str} isn't available. Nearby open times: {times_str}"
+                    result = f"{time_str} on {date_str} isn't available. Closest open times: {times_str}"
                 else:
                     result = f"There's nothing open on {date_str} during business hours — offer another date."
         else:
