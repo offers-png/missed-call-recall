@@ -1200,30 +1200,14 @@ async def setup_agent(
     if webhook_tools:
         conversation_config["agent"]["prompt"]["tools"] = webhook_tools
 
-    if transfer_target:
-        conversation_config["agent"]["prompt"]["built_in_tools"] = {
-            "transfer_to_number": {
-                "type": "system",
-                "name": "transfer_to_number",
-                "description": (
-                    "Transfer the caller to a person when they explicitly ask for a person, a "
-                    "manager, or customer service, or describe an emergency or urgent situation."
-                ),
-                "params": {
-                    "system_tool_type": "transfer_to_number",
-                    "transfers": [
-                        {
-                            "transfer_destination": {"type": "phone", "phone_number": transfer_target},
-                            "condition": (
-                                "The caller explicitly asks to speak to a person, a manager, or "
-                                "customer service, or describes an emergency or urgent situation."
-                            ),
-                            "transfer_type": "conference",
-                        }
-                    ],
-                },
-            }
-        }
+    # NOTE: transfer_to_number is intentionally NOT set here. ElevenLabs'
+    # agent PATCH endpoint accepts a built_in_tools field without error but
+    # doesn't actually apply it — confirmed by testing: sending it here wipes
+    # out a transfer tool that was correctly configured manually in the
+    # ElevenLabs UI, without the API version ever showing as active either.
+    # So: configure "Transfer to number" once, by hand, in the ElevenLabs UI
+    # (Tools tab → System tools → Transfer to number), and never send it from
+    # here — every previous attempt to manage this via API silently broke it.
 
     def save_agent(existing_agent_id):
         if existing_agent_id:
@@ -1244,13 +1228,6 @@ async def setup_agent(
 
     agent_id = customer.get("elevenlabs_agent_id")
     resp = save_agent(agent_id)
-    if not resp.ok and "built_in_tools" in conversation_config["agent"]["prompt"]:
-        # The account might not have live transfer enabled, or a field might
-        # not match this account's plan — drop only the transfer tool and
-        # retry, so calendar/notify webhook tools survive intact.
-        log.error(f"Agent save failed, retrying without transfer_to_number: {resp.text[:300]}")
-        del conversation_config["agent"]["prompt"]["built_in_tools"]
-        resp = save_agent(agent_id)
     if not resp.ok:
         raise HTTPException(502, f"Couldn't save ElevenLabs agent: {resp.text[:300]}")
     if not agent_id:
