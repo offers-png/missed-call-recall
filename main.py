@@ -1755,7 +1755,7 @@ async def set_transfer_phone(customer_id: str, request: Request, authorization: 
     return {
         "transfer_phone": e164,
         "note": (
-            "Saved. If your AI voice agent is already set up, re-save it on the AI voice agent "
+            "If your AI voice agent is already set up, re-save it on the AI voice agent "
             "setup page so live transfers use this number."
         ),
     }
