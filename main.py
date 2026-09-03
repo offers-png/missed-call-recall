@@ -751,6 +751,23 @@ REMINDER_JOB_SECRET = os.environ.get("REMINDER_JOB_SECRET")
 if not REMINDER_JOB_SECRET:
     REMINDER_JOB_SECRET = secrets.token_hex(24)
     log.warning("REMINDER_JOB_SECRET not set — using a random per-restart value. Set it in Render.")
+REMINDER_MIN_DELAY_SECONDS = int(os.environ.get("REMINDER_MIN_DELAY_SECONDS", "120"))
+
+
+def business_local_time_str(appointment_start) -> str:
+    """Format a stored appointment_start as a human-readable LOCAL time.
+
+    Supabase/Postgres normalizes timestamptz columns to UTC on write, so
+    reading appointment_start back and calling .strftime() directly on it
+    prints the UTC clock time, not the business's local time (e.g. a 9:30 PM
+    EDT appointment round-trips as ~1:30 AM UTC the next day). Always
+    re-localize to BUSINESS_TZ before formatting.
+    """
+    from zoneinfo import ZoneInfo
+    dt = appointment_start if isinstance(appointment_start, datetime) else datetime.fromisoformat(appointment_start)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(ZoneInfo(BUSINESS_TZ)).strftime("%-I:%M %p")
 
 
 @app.post("/internal/send-reminders")
@@ -780,7 +797,17 @@ async def send_reminders(request: Request):
         if minutes_until > lead_minutes:
             continue  # not due yet
 
-        local_time = appt_time.strftime("%-I:%M %p")
+        # Give the customer at least a couple minutes after booking before a
+        # reminder can fire — otherwise a short-notice booking (e.g. made
+        # 51 minutes out with a 60-minute lead time) triggers a callback
+        # before they've even hung up the original call.
+        created_at = appt.get("created_at")
+        if created_at:
+            seconds_since_booked = (now - datetime.fromisoformat(created_at)).total_seconds()
+            if seconds_since_booked < REMINDER_MIN_DELAY_SECONDS:
+                continue  # too soon after booking — wait for a later run
+
+        local_time = business_local_time_str(appt_time)
         message = (
             f"Reminder: you have an appointment with {customer['business_name']} "
             f"today at {local_time}. See you soon!"
@@ -834,8 +861,7 @@ async def reminder_twiml(appointment_id: str):
 
     row = appt.data[0]
     customer = row.get("recall_customers") or {}
-    appt_time = datetime.fromisoformat(row["appointment_start"])
-    local_time = appt_time.strftime("%-I:%M %p")
+    local_time = business_local_time_str(row["appointment_start"])
     business_name = customer.get("business_name", "the business")
     vr.say(
         f"Hi, this is a reminder from {business_name}. "
