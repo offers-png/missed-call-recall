@@ -127,6 +127,18 @@ def require_auth(customer_id: str, authorization: str = Header(None)):
         raise HTTPException(403, "Not authorized for this account.")
 
 
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET")
+if not ADMIN_SECRET:
+    ADMIN_SECRET = secrets.token_hex(24)
+    log.warning("ADMIN_SECRET not set — using a random per-restart value. Set it in Render.")
+
+
+def require_admin(authorization: str = Header(None)):
+    """For Saleh-only internal endpoints — not tied to any customer account."""
+    if not authorization or authorization.removeprefix("Bearer ").strip() != ADMIN_SECRET:
+        raise HTTPException(401, "Not authorized.")
+
+
 def require_twilio():
     if twilio_client is None:
         raise HTTPException(503, "Twilio isn't configured yet — add TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN.")
@@ -1594,3 +1606,75 @@ async def tool_notify_owner(customer_id: str, request: Request):
     except Exception as e:
         log.error(f"notify-owner SMS failed for {customer_id}: {e}")
         return {"result": "Notification failed to send — proceed with the transfer anyway."}
+
+
+# ---------------------------------------------------------------------------
+# NUMBER SETUP OPTIONS — a customer can either forward their existing number
+# to the AI's Twilio number (instant, self-serve) or request a full port-in
+# (their real number moves into Twilio — takes days to weeks, can be
+# rejected, requires carrier account details).
+# ---------------------------------------------------------------------------
+
+FORWARDING_CARRIERS = {
+    "verizon": {"label": "Verizon", "activate": "*72", "deactivate": "*73", "note": "Dial *72 followed by the 10-digit number, then Call. Wait for the confirmation tone."},
+    "att": {"label": "AT&T", "activate": "*21*", "deactivate": "##21#", "note": "Dial *21* followed by the 10-digit number, then #, then Call."},
+    "tmobile": {"label": "T-Mobile", "activate": "*21*", "deactivate": "##21#", "note": "Dial *21* followed by the 10-digit number, then #, then Call."},
+    "spectrum": {"label": "Spectrum Business", "activate": "*72", "deactivate": "*73", "note": "Dial *72 followed by the 10-digit number, then Call. You can also manage this from your Spectrum Business online account."},
+    "optimum": {"label": "Optimum", "activate": "*72", "deactivate": "*73", "note": "Dial *72 followed by the 10-digit number, then Call. You can also manage this from your Optimum online account."},
+    "other": {"label": "Other / not sure", "activate": "*72", "deactivate": "*73", "note": "*72 to forward and *73 to cancel works on most US carriers. If it doesn't work on yours, ask your carrier for their 'call forwarding' or 'call diversion' feature."},
+}
+
+
+@app.get("/setup/forwarding-instructions/{customer_id}")
+def forwarding_instructions(customer_id: str, carrier: str = "other", authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    cust = sb.table(TABLE_CUST).select("twilio_number").eq("id", customer_id).execute()
+    if not cust.data:
+        raise HTTPException(404, "Not found")
+    info = FORWARDING_CARRIERS.get(carrier, FORWARDING_CARRIERS["other"])
+    ai_number = cust.data[0]["twilio_number"]
+    return {
+        "carrier": info["label"],
+        "ai_number": ai_number,
+        "activate_code": f"{info['activate']}{ai_number.lstrip('+1')}",
+        "deactivate_code": info["deactivate"],
+        "instructions": info["note"],
+        "caveat": "This only forwards calls, not texts — your AI number handles texts either way. Some very basic landline plans need a small add-on from the carrier to enable forwarding at all.",
+    }
+
+
+@app.post("/porting/request/{customer_id}")
+async def request_port_in(customer_id: str, request: Request, authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    body = await request.json()
+    required = ["number_to_port", "authorized_name", "service_address_line1",
+                "service_address_city", "service_address_state", "service_address_zip", "losing_carrier"]
+    missing = [f for f in required if not body.get(f)]
+    if missing:
+        raise HTTPException(400, f"Missing required fields: {', '.join(missing)}")
+
+    row = {f: body[f] for f in required}
+    row["customer_id"] = customer_id
+    row["account_number"] = body.get("account_number")
+    row["account_pin"] = body.get("account_pin")
+    sb.table("recall_port_requests").insert(row).execute()
+
+    return {
+        "status": "submitted_by_customer",
+        "message": (
+            "Your port-in request has been submitted for review. Porting a phone number "
+            "typically takes anywhere from a few days to about 4 weeks, and your current "
+            "carrier can reject the request if any details don't match their records exactly "
+            "— we'll follow up either way. Your existing number keeps working normally the "
+            "entire time; nothing changes until the port actually completes."
+        ),
+    }
+
+
+@app.get("/porting/requests")
+def list_port_requests(authorization: str = Header(None)):
+    """Internal review list — Saleh checks this before manually submitting
+    qualifying requests through Twilio's porting console."""
+    require_admin(authorization)
+    rows = sb.table("recall_port_requests").select("*, recall_customers(business_name)").order("created_at", desc=True).execute()
+    return rows.data
