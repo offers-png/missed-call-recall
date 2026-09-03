@@ -1023,13 +1023,10 @@ async def setup_agent(
         update["elevenlabs_kb_doc_id"] = kb_doc_id
 
     # 2. Create or update the ElevenLabs agent for this business.
-    # NOTE: "transfer" currently behaves like "message" — the real live-transfer
-    # tool needs ElevenLabs' built_in_tools.transfer_to_number config, which
-    # failed twice with an undocumented schema. Rather than tell the AI it can
-    # transfer when it can't, it takes a message honestly until that's fixed.
+    transfer_target = customer.get("transfer_phone") or customer.get("business_phone")
     fallback_instructions = {
         "message": "If you don't know the answer, politely ask for their name and phone number so someone can call them back — don't guess.",
-        "transfer": "If you don't know the answer, politely ask for their name and phone number so someone can call them back — don't guess. Do not offer to transfer the call; you don't have that ability.",
+        "transfer": "If you don't know the answer, offer to connect them to a person using your transfer ability.",
         "try_harder": "Check the knowledge base carefully before giving up — rephrase the question in your head and look again. Only if you're truly certain the answer isn't in the knowledge base, ask for their name and number for a callback.",
     }
     system_prompt = (
@@ -1037,6 +1034,15 @@ async def setup_agent(
         "Be friendly, concise, and helpful. Answer questions using the knowledge base provided. "
         + fallback_instructions[fallback_behavior]
     )
+    if transfer_target:
+        system_prompt += (
+            " If the caller explicitly asks to speak to a person, a manager, or customer service, "
+            "or describes any kind of emergency or urgent situation, you can connect them directly. "
+            "First call notify_owner (set is_emergency to true only for genuine emergencies, and give "
+            "a one-sentence reason) so the person receiving the call has context even if they can't "
+            "answer right away, then use your transfer ability to connect the call. Do this without "
+            "making the caller repeat themselves."
+        )
     calendar_connected = customer.get("tier") == "elite" and customer.get("google_calendar_connected")
     if calendar_connected:
         from zoneinfo import ZoneInfo
@@ -1074,8 +1080,8 @@ async def setup_agent(
         ]
 
     webhook_tools = []
+    tool_secret_header = {"X-Tool-Secret": ELEVENLABS_TOOL_SECRET}
     if calendar_connected:
-        tool_secret_header = {"X-Tool-Secret": ELEVENLABS_TOOL_SECRET}
         webhook_tools.extend([
             {
                 "type": "webhook",
@@ -1116,12 +1122,52 @@ async def setup_agent(
                 },
             },
         ])
+    if transfer_target:
+        webhook_tools.append({
+            "type": "webhook",
+            "name": "notify_owner",
+            "description": "Send a text heads-up to the business before transferring a call to them — call this right before connecting the caller, always.",
+            "api_schema": {
+                "url": f"{PUBLIC_BASE_URL}/tools/notify-owner/{customer_id}",
+                "method": "POST",
+                "request_headers": tool_secret_header,
+                "request_body_schema": {
+                    "type": "object",
+                    "properties": {
+                        "is_emergency": {"type": "boolean", "description": "True only for a genuine emergency or urgent situation."},
+                        "reason": {"type": "string", "description": "One short sentence on why the caller wants to be connected."},
+                    },
+                    "required": ["is_emergency"],
+                },
+            },
+        })
     if webhook_tools:
         conversation_config["agent"]["prompt"]["tools"] = webhook_tools
 
-    # transfer_to_number system tool intentionally not attached — see note
-    # above fallback_instructions. Revisit once the schema is confirmed
-    # against real ElevenLabs docs/testing, not search-result guesses.
+    if transfer_target:
+        conversation_config["agent"]["prompt"]["built_in_tools"] = {
+            "transfer_to_number": {
+                "type": "system",
+                "name": "transfer_to_number",
+                "description": (
+                    "Transfer the caller to a person when they explicitly ask for a person, a "
+                    "manager, or customer service, or describe an emergency or urgent situation."
+                ),
+                "params": {
+                    "system_tool_type": "transfer_to_number",
+                    "transfers": [
+                        {
+                            "transfer_destination": {"type": "phone", "phone_number": transfer_target},
+                            "condition": (
+                                "The caller explicitly asks to speak to a person, a manager, or "
+                                "customer service, or describes an emergency or urgent situation."
+                            ),
+                            "transfer_type": "conference",
+                        }
+                    ],
+                },
+            }
+        }
 
     def save_agent(existing_agent_id):
         if existing_agent_id:
@@ -1142,16 +1188,12 @@ async def setup_agent(
 
     agent_id = customer.get("elevenlabs_agent_id")
     resp = save_agent(agent_id)
-    if not resp.ok and "tools" in conversation_config["agent"]["prompt"]:
-        # The transfer tool's schema might not match what this ElevenLabs
-        # account expects — drop ONLY that one tool and retry, so calendar
-        # tools (check_availability, book_appointment) survive intact.
-        log.error(f"Agent save failed, retrying with transfer tool removed: {resp.text[:300]}")
-        conversation_config["agent"]["prompt"]["tools"] = [
-            t for t in conversation_config["agent"]["prompt"]["tools"] if t.get("name") != "transfer_to_number"
-        ]
-        if not conversation_config["agent"]["prompt"]["tools"]:
-            del conversation_config["agent"]["prompt"]["tools"]
+    if not resp.ok and "built_in_tools" in conversation_config["agent"]["prompt"]:
+        # The account might not have live transfer enabled, or a field might
+        # not match this account's plan — drop only the transfer tool and
+        # retry, so calendar/notify webhook tools survive intact.
+        log.error(f"Agent save failed, retrying without transfer_to_number: {resp.text[:300]}")
+        del conversation_config["agent"]["prompt"]["built_in_tools"]
         resp = save_agent(agent_id)
     if not resp.ok:
         raise HTTPException(502, f"Couldn't save ElevenLabs agent: {resp.text[:300]}")
@@ -1515,3 +1557,40 @@ async def tool_book_appointment(customer_id: str, request: Request):
     except Exception:
         log.exception(f"book-appointment crashed for {customer_id}")
         return {"result": "I couldn't book that — please offer to take a message instead."}
+
+
+@app.post("/tools/notify-owner/{customer_id}")
+async def tool_notify_owner(customer_id: str, request: Request):
+    """Called by the AI right before it transfers a call, so the owner gets a
+    text heads-up even if they don't pick up the actual transferred call —
+    a live warm-transfer message only reaches them if they answer; this
+    doesn't depend on that."""
+    check_tool_secret({k.lower(): v for k, v in request.headers.items()})
+    body = await request.json()
+    p = body if "is_emergency" in body or "reason" in body else body.get("parameters", {})
+    is_emergency = bool(p.get("is_emergency"))
+    reason = (p.get("reason") or "").strip()
+
+    cust = sb.table(TABLE_CUST).select("*").eq("id", customer_id).execute()
+    if not cust.data:
+        return {"result": "Couldn't send the notification — proceed with the transfer anyway."}
+    customer = cust.data[0]
+    target = customer.get("transfer_phone") or customer.get("business_phone")
+    if not target:
+        return {"result": "No transfer contact number is configured — proceed with the transfer anyway."}
+
+    if is_emergency:
+        message = f"🚨 URGENT call for {customer['business_name']} being connected to you now"
+    else:
+        message = f"Heads up: a caller is being connected to you now for {customer['business_name']}"
+    if reason:
+        message += f" — {reason}."
+    else:
+        message += "."
+
+    try:
+        twilio_client.messages.create(to=target, from_=customer["twilio_number"], body=message)
+        return {"result": "Notified. Proceed with the transfer."}
+    except Exception as e:
+        log.error(f"notify-owner SMS failed for {customer_id}: {e}")
+        return {"result": "Notification failed to send — proceed with the transfer anyway."}
