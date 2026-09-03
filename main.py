@@ -1070,11 +1070,15 @@ async def setup_agent(
     if transfer_target:
         system_prompt += (
             " If the caller explicitly asks to speak to a person, a manager, or customer service, "
-            "or describes any kind of emergency or urgent situation, you can connect them directly. "
-            "First call notify_owner (set is_emergency to true only for genuine emergencies, and give "
-            "a one-sentence reason) so the person receiving the call has context even if they can't "
-            "answer right away, then use your transfer ability to connect the call. Do this without "
-            "making the caller repeat themselves."
+            "or describes any kind of emergency or urgent situation, do exactly this, in order: "
+            "(1) call notify_owner (set is_emergency to true only for genuine emergencies, with a "
+            "one-sentence reason), (2) IMMEDIATELY call your transfer tool in that same turn to "
+            "actually connect the call. Calling notify_owner is not the transfer — it only sends a "
+            "text. You must still call the separate transfer tool right after. Never say phrases like "
+            "'connecting you now', 'please hold', 'one moment', or 'you should be connected shortly' "
+            "unless you have already called the transfer tool — if you catch yourself about to say "
+            "any of those without having called it, call it first. Do not narrate a transfer that "
+            "hasn't actually happened."
         )
     calendar_connected = customer.get("tier") == "elite" and customer.get("google_calendar_connected")
     if calendar_connected:
