@@ -12,6 +12,7 @@ ENV VARS REQUIRED (set these on Render):
   PUBLIC_BASE_URL   e.g. https://main-backend-k32m.onrender.com
 """
 import os
+import re
 import hmac
 import hashlib
 import secrets
@@ -1710,11 +1711,12 @@ FORWARDING_CARRIERS = {
 @app.get("/setup/forwarding-instructions/{customer_id}")
 def forwarding_instructions(customer_id: str, carrier: str = "other", authorization: str = Header(None)):
     require_auth(customer_id, authorization)
-    cust = sb.table(TABLE_CUST).select("twilio_number").eq("id", customer_id).execute()
+    cust = sb.table(TABLE_CUST).select("twilio_number, transfer_phone, business_phone").eq("id", customer_id).execute()
     if not cust.data:
         raise HTTPException(404, "Not found")
     info = FORWARDING_CARRIERS.get(carrier, FORWARDING_CARRIERS["other"])
-    ai_number = cust.data[0]["twilio_number"]
+    row = cust.data[0]
+    ai_number = row["twilio_number"]
     ten_digit = ai_number[2:] if ai_number.startswith("+1") else ai_number
     return {
         "carrier": info["label"],
@@ -1723,6 +1725,39 @@ def forwarding_instructions(customer_id: str, carrier: str = "other", authorizat
         "deactivate_code": info["deactivate"],
         "instructions": info["note"],
         "caveat": "This only forwards calls, not texts — your AI number handles texts either way. Some very basic landline plans need a small add-on from the carrier to enable forwarding at all.",
+        "current_transfer_phone": row.get("transfer_phone") or row.get("business_phone"),
+    }
+
+
+def normalize_us_phone(raw: str) -> str:
+    """Best-effort E.164 normalization for a US number typed in any common format."""
+    digits = re.sub(r"\D", "", raw or "")
+    if len(digits) == 10:
+        return f"+1{digits}"
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    raise HTTPException(400, "That doesn't look like a valid 10-digit US phone number.")
+
+
+@app.post("/setup/transfer-phone/{customer_id}")
+async def set_transfer_phone(customer_id: str, request: Request, authorization: str = Header(None)):
+    """The number a customer is forwarding to their AI line — used for live
+    call transfers and emergency/callback SMS. Deliberately separate from
+    business_phone (which is just the signup contact) since a customer may
+    forward a completely different line than the one they signed up with."""
+    require_auth(customer_id, authorization)
+    body = await request.json()
+    raw = (body.get("transfer_phone") or "").strip()
+    if not raw:
+        raise HTTPException(400, "Missing transfer_phone.")
+    e164 = normalize_us_phone(raw)
+    sb.table(TABLE_CUST).update({"transfer_phone": e164}).eq("id", customer_id).execute()
+    return {
+        "transfer_phone": e164,
+        "note": (
+            "Saved. If your AI voice agent is already set up, re-save it on the AI voice agent "
+            "setup page so live transfers use this number."
+        ),
     }
 
 
