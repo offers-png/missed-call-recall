@@ -776,12 +776,15 @@ async def send_reminders(request: Request):
         raise HTTPException(401, "Invalid job secret.")
 
     now = datetime.now(timezone.utc)
-    # Pull any not-yet-reminded, still-upcoming appointment — we filter by
-    # each customer's own reminder_minutes_before below, since that varies.
+    # Pull any still-upcoming appointment with at least one reminder still
+    # pending — text and call fire independently, each on its own lead time.
     due = (
         sb.table("recall_appointments")
-        .select("*, recall_customers(business_name, reminder_minutes_before, twilio_number)")
-        .eq("reminder_sent", False)
+        .select(
+            "*, recall_customers(business_name, reminder_text_minutes_before, "
+            "reminder_call_minutes_before, twilio_number)"
+        )
+        .or_("reminder_text_sent.eq.false,reminder_call_sent.eq.false")
         .gt("appointment_start", now.isoformat())
         .execute()
     )
@@ -791,16 +794,13 @@ async def send_reminders(request: Request):
         customer = appt.get("recall_customers")
         if not customer:
             continue
-        lead_minutes = customer.get("reminder_minutes_before", 60)
         appt_time = datetime.fromisoformat(appt["appointment_start"])
         minutes_until = (appt_time - now).total_seconds() / 60
-        if minutes_until > lead_minutes:
-            continue  # not due yet
 
-        # Give the customer at least a couple minutes after booking before a
-        # reminder can fire — otherwise a short-notice booking (e.g. made
-        # 51 minutes out with a 60-minute lead time) triggers a callback
-        # before they've even hung up the original call.
+        # Give the customer at least a couple minutes after booking before
+        # ANY reminder can fire — otherwise a short-notice booking (e.g. made
+        # 10 minutes out with a 15-minute call lead time) triggers a callback
+        # before they've even hung up the original booking call.
         created_at = appt.get("created_at")
         if created_at:
             seconds_since_booked = (now - datetime.fromisoformat(created_at)).total_seconds()
@@ -808,37 +808,37 @@ async def send_reminders(request: Request):
                 continue  # too soon after booking — wait for a later run
 
         local_time = business_local_time_str(appt_time)
-        message = (
-            f"Reminder: you have an appointment with {customer['business_name']} "
-            f"today at {local_time}. See you soon!"
-        )
-        text_ok = False
-        try:
-            twilio_client.messages.create(
-                to=appt["caller_phone"], from_=customer["twilio_number"], body=message
-            )
-            text_ok = True
-        except Exception as e:
-            log.error(f"Reminder text failed for appointment {appt['id']}: {e}")
+        updates = {}
 
-        # Also place an outbound voice call reading the same reminder — this
-        # runs independently of the text above (Voice and SMS are separate
-        # Twilio subsystems with separate compliance requirements), so a text
-        # failure never blocks the call, and vice versa.
-        call_ok = False
-        try:
-            twilio_client.calls.create(
-                to=appt["caller_phone"],
-                from_=customer["twilio_number"],
-                url=f"{PUBLIC_BASE_URL}/twilio/reminder-twiml/{appt['id']}",
-                method="POST",
+        text_lead = customer.get("reminder_text_minutes_before", 60)
+        if not appt.get("reminder_text_sent") and minutes_until <= text_lead:
+            message = (
+                f"Reminder: you have an appointment with {customer['business_name']} "
+                f"today at {local_time}. See you soon!"
             )
-            call_ok = True
-        except Exception as e:
-            log.error(f"Reminder call failed for appointment {appt['id']}: {e}")
+            try:
+                twilio_client.messages.create(
+                    to=appt["caller_phone"], from_=customer["twilio_number"], body=message
+                )
+                updates["reminder_text_sent"] = True
+            except Exception as e:
+                log.error(f"Reminder text failed for appointment {appt['id']}: {e}")
 
-        if text_ok or call_ok:
-            sb.table("recall_appointments").update({"reminder_sent": True}).eq("id", appt["id"]).execute()
+        call_lead = customer.get("reminder_call_minutes_before", 15)
+        if not appt.get("reminder_call_sent") and minutes_until <= call_lead:
+            try:
+                twilio_client.calls.create(
+                    to=appt["caller_phone"],
+                    from_=customer["twilio_number"],
+                    url=f"{PUBLIC_BASE_URL}/twilio/reminder-twiml/{appt['id']}",
+                    method="POST",
+                )
+                updates["reminder_call_sent"] = True
+            except Exception as e:
+                log.error(f"Reminder call failed for appointment {appt['id']}: {e}")
+
+        if updates:
+            sb.table("recall_appointments").update(updates).eq("id", appt["id"]).execute()
             sent += 1
 
     return {"checked": len(due.data), "reminders_sent": sent}
