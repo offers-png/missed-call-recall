@@ -615,6 +615,8 @@ async def twilio_sms(request: Request):
     turns = list(reversed(history.data))
 
     business_info = customer.get("business_info_text") or "No business information has been provided yet."
+    can_book = customer.get("tier") == "elite" and bool(customer.get("google_calendar_refresh_token"))
+
     system_prompt = (
         f"You are the text-message assistant for {customer['business_name']}. "
         "Answer questions using the business info below. Be brief and friendly — "
@@ -623,29 +625,106 @@ async def twilio_sms(request: Request):
         "honestly and suggest calling the store directly.\n\n"
         f"Business info:\n{business_info}"
     )
+    tools = None
+    if can_book:
+        system_prompt += (
+            "\n\nYou can also check availability and book appointments directly in this "
+            "text conversation using the tools provided. Today's date is "
+            f"{datetime.now().strftime('%Y-%m-%d')}. Get the date and time the customer "
+            "wants, confirm their name, then book it — you already have their phone number "
+            "from this text conversation, so don't ask for it."
+        )
+        tools = [
+            {
+                "name": "check_availability",
+                "description": "Check open appointment slots on a given date, optionally near a specific time.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "date": {"type": "string", "description": "YYYY-MM-DD"},
+                        "time": {"type": "string", "description": "Optional specific time, 24-hour HH:MM"},
+                    },
+                    "required": ["date"],
+                },
+            },
+            {
+                "name": "book_appointment",
+                "description": "Book an appointment once the customer has confirmed a date, time, and their name.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "date": {"type": "string", "description": "YYYY-MM-DD"},
+                        "time": {"type": "string", "description": "24-hour HH:MM"},
+                        "caller_name": {"type": "string"},
+                    },
+                    "required": ["date", "time", "caller_name"],
+                },
+            },
+        ]
+
     messages = [
         {"role": "user" if t["direction"] == "inbound" else "assistant", "content": t["body"]}
         for t in turns
     ]
 
+    def call_booking_tool(name: str, tool_input: dict) -> str:
+        payload = dict(tool_input)
+        if name == "book_appointment":
+            payload["caller_phone"] = from_number
+        try:
+            endpoint = "check-availability" if name == "check_availability" else "book-appointment"
+            resp = requests.post(
+                f"{PUBLIC_BASE_URL}/tools/{endpoint}/{customer['id']}",
+                headers={"X-Tool-Secret": ELEVENLABS_TOOL_SECRET, "Content-Type": "application/json"},
+                json=payload,
+                timeout=20,
+            )
+            return resp.json().get("result", "Something went wrong checking that — try again.")
+        except Exception as e:
+            log.error(f"SMS booking tool '{name}' failed for {customer['id']}: {e}")
+            return "Something went wrong checking that — try again shortly."
+
     try:
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": ANTHROPIC_MODEL,
-                "max_tokens": 300,
-                "system": system_prompt,
-                "messages": messages,
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        reply_text = resp.json()["content"][0]["text"].strip()
+        reply_text = ""
+        for _ in range(5):  # hard cap so a stuck tool loop can't run forever
+            resp = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": ANTHROPIC_MODEL,
+                    "max_tokens": 300,
+                    "system": system_prompt,
+                    "messages": messages,
+                    **({"tools": tools} if tools else {}),
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            content = data["content"]
+            reply_text = "\n".join(b["text"] for b in content if b["type"] == "text").strip()
+
+            if data.get("stop_reason") != "tool_use":
+                break
+
+            messages.append({"role": "assistant", "content": content})
+            tool_results = []
+            for block in content:
+                if block["type"] == "tool_use":
+                    result_text = call_booking_tool(block["name"], block["input"])
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block["id"],
+                        "content": result_text,
+                    })
+            messages.append({"role": "user", "content": tool_results})
+
+        if not reply_text:
+            reply_text = "Got it — let me know if there's anything else I can help with."
     except Exception as e:
         log.error(f"SMS AI failed for {customer['id']}: {e}")
         reply_text = "Sorry, I'm having trouble answering right now — please call us directly."
@@ -706,16 +785,63 @@ async def send_reminders(request: Request):
             f"Reminder: you have an appointment with {customer['business_name']} "
             f"today at {local_time}. See you soon!"
         )
+        text_ok = False
         try:
             twilio_client.messages.create(
                 to=appt["caller_phone"], from_=customer["twilio_number"], body=message
             )
+            text_ok = True
+        except Exception as e:
+            log.error(f"Reminder text failed for appointment {appt['id']}: {e}")
+
+        # Also place an outbound voice call reading the same reminder — this
+        # runs independently of the text above (Voice and SMS are separate
+        # Twilio subsystems with separate compliance requirements), so a text
+        # failure never blocks the call, and vice versa.
+        call_ok = False
+        try:
+            twilio_client.calls.create(
+                to=appt["caller_phone"],
+                from_=customer["twilio_number"],
+                url=f"{PUBLIC_BASE_URL}/twilio/reminder-twiml/{appt['id']}",
+                method="POST",
+            )
+            call_ok = True
+        except Exception as e:
+            log.error(f"Reminder call failed for appointment {appt['id']}: {e}")
+
+        if text_ok or call_ok:
             sb.table("recall_appointments").update({"reminder_sent": True}).eq("id", appt["id"]).execute()
             sent += 1
-        except Exception as e:
-            log.error(f"Reminder send failed for appointment {appt['id']}: {e}")
 
     return {"checked": len(due.data), "reminders_sent": sent}
+
+
+@app.post("/twilio/reminder-twiml/{appointment_id}")
+async def reminder_twiml(appointment_id: str):
+    """Twilio fetches this when a reminder call connects (including to voicemail —
+    Twilio still plays <Say> content even if a machine picks up)."""
+    vr = VoiceResponse()
+    appt = (
+        sb.table("recall_appointments")
+        .select("*, recall_customers(business_name)")
+        .eq("id", appointment_id)
+        .execute()
+    )
+    if not appt.data:
+        vr.say("Sorry, we couldn't find your appointment details.")
+        return PlainTextResponse(str(vr), media_type="application/xml")
+
+    row = appt.data[0]
+    customer = row.get("recall_customers") or {}
+    appt_time = datetime.fromisoformat(row["appointment_start"])
+    local_time = appt_time.strftime("%-I:%M %p")
+    business_name = customer.get("business_name", "the business")
+    vr.say(
+        f"Hi, this is a reminder from {business_name}. "
+        f"You have an appointment today at {local_time}. We look forward to seeing you. Goodbye."
+    )
+    return PlainTextResponse(str(vr), media_type="application/xml")
 
 
 # ---------------------------------------------------------------------------
