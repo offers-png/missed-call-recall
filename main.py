@@ -531,6 +531,15 @@ def dashboard(customer_id: str, authorization: str = Header(None)):
     total = len(calls.data)
     texted = sum(1 for c in calls.data if c["sms_sent"])
 
+    messages = (
+        sb.table("recall_messages")
+        .select("*")
+        .eq("customer_id", customer_id)
+        .order("created_at", desc=True)
+        .limit(50)
+        .execute()
+    )
+
     return {
         "business_name": customer["business_name"],
         "status": customer["status"],
@@ -539,7 +548,18 @@ def dashboard(customer_id: str, authorization: str = Header(None)):
         "trial_ends_at": customer["trial_ends_at"],
         "stats": {"missed_calls_recent": total, "auto_texts_sent": texted},
         "recent_calls": calls.data,
+        "messages": messages.data,
     }
+
+
+@app.post("/messages/{message_id}/resolve")
+def resolve_message(message_id: str, customer_id: str = Form(...), authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    msg = sb.table("recall_messages").select("customer_id").eq("id", message_id).execute()
+    if not msg.data or msg.data[0]["customer_id"] != customer_id:
+        raise HTTPException(404, "Not found")
+    sb.table("recall_messages").update({"resolved": True}).eq("id", message_id).execute()
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
@@ -1037,9 +1057,9 @@ async def setup_agent(
     # 2. Create or update the ElevenLabs agent for this business.
     transfer_target = customer.get("transfer_phone") or customer.get("business_phone")
     fallback_instructions = {
-        "message": "If you don't know the answer, politely ask for their name and phone number so someone can call them back — don't guess.",
+        "message": "If you don't know the answer, politely ask for their name and phone number, then call take_message with those details so someone actually gets notified — don't just say you'll pass it along without calling the tool.",
         "transfer": "If you don't know the answer, offer to connect them to a person using your transfer ability.",
-        "try_harder": "Check the knowledge base carefully before giving up — rephrase the question in your head and look again. Only if you're truly certain the answer isn't in the knowledge base, ask for their name and number for a callback.",
+        "try_harder": "Check the knowledge base carefully before giving up — rephrase the question in your head and look again. Only if you're truly certain the answer isn't in the knowledge base, ask for their name and number, then call take_message with those details.",
     }
     system_prompt = (
         f"You are the phone receptionist for {customer['business_name']}. "
@@ -1134,6 +1154,25 @@ async def setup_agent(
                 },
             },
         ])
+    webhook_tools.append({
+        "type": "webhook",
+        "name": "take_message",
+        "description": "Log a callback request when you can't help the caller directly — always call this rather than just telling the caller you'll pass their info along.",
+        "api_schema": {
+            "url": f"{PUBLIC_BASE_URL}/tools/take-message/{customer_id}",
+            "method": "POST",
+            "request_headers": tool_secret_header,
+            "request_body_schema": {
+                "type": "object",
+                "properties": {
+                    "caller_name": {"type": "string", "description": "The caller's name, if given"},
+                    "caller_phone": {"type": "string", "description": "The caller's callback phone number"},
+                    "note": {"type": "string", "description": "One short sentence on what they need"},
+                },
+                "required": ["caller_phone"],
+            },
+        },
+    })
     if transfer_target:
         webhook_tools.append({
             "type": "webhook",
@@ -1608,6 +1647,49 @@ async def tool_notify_owner(customer_id: str, request: Request):
         return {"result": "Notification failed to send — proceed with the transfer anyway."}
 
 
+@app.post("/tools/take-message/{customer_id}")
+async def tool_take_message(customer_id: str, request: Request):
+    """Called when the AI can't help and needs to take a callback message.
+    Stores it AND texts the owner immediately — previously the AI would only
+    say 'I'll pass this along' with nothing actually behind that promise."""
+    check_tool_secret({k.lower(): v for k, v in request.headers.items()})
+    body = await request.json()
+    p = body if "caller_phone" in body else body.get("parameters", {})
+    caller_name = (p.get("caller_name") or "").strip()
+    caller_phone = (p.get("caller_phone") or "").strip()
+    note = (p.get("note") or "").strip()
+    if not caller_phone:
+        return {"result": "I need a callback phone number before I can log this."}
+
+    cust = sb.table(TABLE_CUST).select("*").eq("id", customer_id).execute()
+    if not cust.data:
+        return {"result": "Couldn't save that message — apologize and let them know someone will follow up."}
+    customer = cust.data[0]
+
+    try:
+        sb.table("recall_messages").insert({
+            "customer_id": customer_id,
+            "caller_name": caller_name or None,
+            "caller_phone": caller_phone,
+            "note": note or None,
+        }).execute()
+    except Exception as e:
+        log.error(f"take-message save failed for {customer_id}: {e}")
+        return {"result": "Couldn't save that message — apologize and let them know someone will follow up."}
+
+    target = customer.get("transfer_phone") or customer.get("business_phone")
+    if target:
+        sms = f"📋 Callback request for {customer['business_name']}: {caller_name or 'no name given'}, {caller_phone}"
+        if note:
+            sms += f" — {note}"
+        try:
+            twilio_client.messages.create(to=target, from_=customer["twilio_number"], body=sms)
+        except Exception as e:
+            log.error(f"take-message owner SMS failed for {customer_id}: {e}")
+
+    return {"result": "Logged. Let the caller know someone will follow up soon."}
+
+
 # ---------------------------------------------------------------------------
 # NUMBER SETUP OPTIONS — a customer can either forward their existing number
 # to the AI's Twilio number (instant, self-serve) or request a full port-in
@@ -1616,12 +1698,12 @@ async def tool_notify_owner(customer_id: str, request: Request):
 # ---------------------------------------------------------------------------
 
 FORWARDING_CARRIERS = {
-    "verizon": {"label": "Verizon", "activate": "*72", "deactivate": "*73", "note": "Dial *72 followed by the 10-digit number, then Call. Wait for the confirmation tone."},
-    "att": {"label": "AT&T", "activate": "*21*", "deactivate": "##21#", "note": "Dial *21* followed by the 10-digit number, then #, then Call."},
-    "tmobile": {"label": "T-Mobile", "activate": "*21*", "deactivate": "##21#", "note": "Dial *21* followed by the 10-digit number, then #, then Call."},
-    "spectrum": {"label": "Spectrum Business", "activate": "*72", "deactivate": "*73", "note": "Dial *72 followed by the 10-digit number, then Call. You can also manage this from your Spectrum Business online account."},
-    "optimum": {"label": "Optimum", "activate": "*72", "deactivate": "*73", "note": "Dial *72 followed by the 10-digit number, then Call. You can also manage this from your Optimum online account."},
-    "other": {"label": "Other / not sure", "activate": "*72", "deactivate": "*73", "note": "*72 to forward and *73 to cancel works on most US carriers. If it doesn't work on yours, ask your carrier for their 'call forwarding' or 'call diversion' feature."},
+    "verizon": {"label": "Verizon", "activate_fmt": "*72{n}", "deactivate": "*73", "note": "Dial *72 followed by the 10-digit number, then Call. Wait for the confirmation tone."},
+    "att": {"label": "AT&T", "activate_fmt": "*21*{n}#", "deactivate": "##21#", "note": "Dial *21* followed by the 10-digit number, then #, then Call."},
+    "tmobile": {"label": "T-Mobile", "activate_fmt": "*21*{n}#", "deactivate": "##21#", "note": "Dial *21* followed by the 10-digit number, then #, then Call."},
+    "spectrum": {"label": "Spectrum Business", "activate_fmt": "*72{n}", "deactivate": "*73", "note": "Dial *72 followed by the 10-digit number, then Call. You can also manage this from your Spectrum Business online account."},
+    "optimum": {"label": "Optimum", "activate_fmt": "*72{n}", "deactivate": "*73", "note": "Dial *72 followed by the 10-digit number, then Call. You can also manage this from your Optimum online account."},
+    "other": {"label": "Other / not sure", "activate_fmt": "*72{n}", "deactivate": "*73", "note": "*72 to forward and *73 to cancel works on most US carriers. If it doesn't work on yours, ask your carrier for their 'call forwarding' or 'call diversion' feature."},
 }
 
 
@@ -1633,10 +1715,11 @@ def forwarding_instructions(customer_id: str, carrier: str = "other", authorizat
         raise HTTPException(404, "Not found")
     info = FORWARDING_CARRIERS.get(carrier, FORWARDING_CARRIERS["other"])
     ai_number = cust.data[0]["twilio_number"]
+    ten_digit = ai_number[2:] if ai_number.startswith("+1") else ai_number
     return {
         "carrier": info["label"],
         "ai_number": ai_number,
-        "activate_code": f"{info['activate']}{ai_number.lstrip('+1')}",
+        "activate_code": info["activate_fmt"].format(n=ten_digit),
         "deactivate_code": info["deactivate"],
         "instructions": info["note"],
         "caveat": "This only forwards calls, not texts — your AI number handles texts either way. Some very basic landline plans need a small add-on from the carrier to enable forwarding at all.",
