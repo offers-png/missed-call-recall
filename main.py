@@ -167,7 +167,57 @@ app.add_middleware(
 )
 
 TABLE_CUST = "recall_customers"
+TABLE_LOC = "recall_locations"
 TABLE_CALLS = "recall_missed_calls"
+
+
+# ---------------------------------------------------------------------------
+# LOCATION HELPERS — recall_customers is the ACCOUNT (login, billing, tier).
+# recall_locations is where the actual number/AI/booking config lives — one
+# account can have 1+ locations. Most existing endpoints are customer_id-
+# authenticated but operate on a single location; unless a location_id is
+# explicitly passed, they default to that account's PRIMARY location (the
+# earliest-created one) so old frontend calls keep working unchanged.
+# ---------------------------------------------------------------------------
+def get_primary_location(customer_id: str) -> dict:
+    loc = (
+        sb.table(TABLE_LOC)
+        .select("*")
+        .eq("customer_id", customer_id)
+        .order("created_at")
+        .limit(1)
+        .execute()
+    )
+    if not loc.data:
+        raise HTTPException(404, "This account has no location set up yet.")
+    return loc.data[0]
+
+
+def get_location_for_customer(customer_id: str, location_id: str = None) -> dict:
+    """Returns the requested location if it belongs to this customer, else
+    the account's primary location. Use this in every customer_id-authed
+    endpoint that touches per-location config."""
+    if location_id:
+        loc = sb.table(TABLE_LOC).select("*").eq("id", location_id).execute()
+        if not loc.data or loc.data[0]["customer_id"] != customer_id:
+            raise HTTPException(404, "Location not found for this account.")
+        return loc.data[0]
+    return get_primary_location(customer_id)
+
+
+def get_location_by_number(twilio_number: str) -> dict:
+    """Twilio webhooks identify the call/text by number, not customer_id —
+    joins back to recall_customers for account-level fields (tier, status,
+    business_name) so callers get one flat dict either way."""
+    loc = sb.table(TABLE_LOC).select("*, recall_customers(*)").eq("twilio_number", twilio_number).execute()
+    if not loc.data:
+        return None
+    row = loc.data[0]
+    customer = row.pop("recall_customers", None) or {}
+    merged = {**customer, **row}  # location fields win on any name overlap (e.g. business_phone)
+    merged["customer_id"] = row["customer_id"]
+    merged["location_id"] = row["id"]
+    return merged
 
 
 @app.get("/health")
@@ -176,8 +226,109 @@ def health():
 
 
 # ---------------------------------------------------------------------------
-# SIGNUP — creates the customer record, provisions a dedicated Twilio number,
-# and starts a Stripe Checkout session for the subscription (with 7-day trial).
+# LOCATIONS — list an account's locations (for the dashboard switcher) and
+# add a new one to an ALREADY-LOGGED-IN account. This is deliberately a
+# separate endpoint from /signup: /signup creates the account (email must be
+# unique); this only ever buys a number + creates a recall_locations row
+# under an account that already exists. Email and phone number are unrelated
+# — one identifies the login, the other identifies a location's number.
+# ---------------------------------------------------------------------------
+@app.get("/locations/{customer_id}")
+def list_locations(customer_id: str, authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    locs = (
+        sb.table(TABLE_LOC)
+        .select("id, location_label, business_phone, twilio_number, created_at")
+        .eq("customer_id", customer_id)
+        .order("created_at")
+        .execute()
+    )
+    return {"locations": locs.data}
+
+
+@app.post("/locations/add")
+async def add_location(
+    customer_id: str = Form(...),
+    location_label: str = Form(...),
+    business_phone: str = Form(...),
+    area_code: str = Form(None),
+    authorization: str = Header(None),
+):
+    require_auth(customer_id, authorization)
+    require_twilio()
+
+    cust = sb.table(TABLE_CUST).select("id, business_name, tier, status").eq("id", customer_id).execute()
+    if not cust.data:
+        raise HTTPException(404, "Account not found")
+    customer = cust.data[0]
+    if customer["status"] not in ("trial", "active"):
+        raise HTTPException(403, "This account's subscription isn't active — can't add a location right now.")
+
+    # Same warmed-pool-first logic as signup, so a new location doesn't get
+    # hit with A2P propagation delay on top of everything else.
+    pooled = get_warmed_number()
+    if pooled:
+        class _Purchased:
+            phone_number = pooled["phone_number"]
+            sid = pooled["twilio_sid"]
+        purchased = _Purchased()
+    else:
+        log.warning(f"Number pool empty — buying a fresh number for a new location on account {customer_id}.")
+        search_kwargs = {"limit": 1}
+        if area_code:
+            search_kwargs["area_code"] = area_code
+        numbers = twilio_client.available_phone_numbers("US").local.list(**search_kwargs)
+        if not numbers:
+            numbers = twilio_client.available_phone_numbers("US").local.list(limit=1)
+        if not numbers:
+            raise HTTPException(500, "No Twilio numbers available right now — try again shortly.")
+        purchased = twilio_client.incoming_phone_numbers.create(
+            phone_number=numbers[0].phone_number,
+            voice_url=f"{PUBLIC_BASE_URL}/twilio/voice",
+            voice_method="POST",
+            status_callback=f"{PUBLIC_BASE_URL}/twilio/status",
+            status_callback_method="POST",
+            sms_url=f"{PUBLIC_BASE_URL}/twilio/sms",
+            sms_method="POST",
+        )
+        if TWILIO_MESSAGING_SERVICE_SID:
+            try:
+                twilio_client.messaging.v1.services(TWILIO_MESSAGING_SERVICE_SID).phone_numbers.create(
+                    phone_number_sid=purchased.sid
+                )
+            except Exception as e:
+                log.error(f"Failed to add {purchased.phone_number} to A2P sender pool: {e}")
+
+    loc_row = {
+        "customer_id": customer_id,
+        "location_label": location_label.strip() or "New location",
+        "business_phone": business_phone,
+        "twilio_number": purchased.phone_number,
+    }
+    result = sb.table(TABLE_LOC).insert(loc_row).execute()
+    location = result.data[0]
+
+    if pooled:
+        sb.table("recall_number_pool").update({
+            "assigned_to_customer_id": customer_id,
+            "assigned_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", pooled["id"]).execute()
+
+    return {
+        "location_id": location["id"],
+        "twilio_number_assigned": purchased.phone_number,
+        "instructions": (
+            f"Forward this location's business line ({business_phone}) to {purchased.phone_number} "
+            "when unanswered/busy (conditional call forwarding), or route calls directly to it."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# SIGNUP — creates the ACCOUNT (email/password/Stripe/tier) plus its first
+# location (Twilio number + business phone). This is the only place email
+# uniqueness is enforced — every location added after this goes through
+# /locations/add instead, which never touches email at all.
 # ---------------------------------------------------------------------------
 @app.post("/signup")
 async def signup(
@@ -186,17 +337,17 @@ async def signup(
     email: str = Form(...),
     password: str = Form(...),
     business_phone: str = Form(...),  # their real phone, in E.164 e.g. +13155551234
-    tier: str = Form("basic"),        # "basic" or "pro"
+    tier: str = Form("basic"),        # "basic", "pro", or "elite"
     area_code: str = Form(None),      # optional preferred area code for the new number
     reply_template: str = Form(None), # optional custom auto-reply text
 ):
     require_twilio()
     require_stripe()
-    if tier not in ("basic", "pro"):
-        raise HTTPException(400, "tier must be 'basic' or 'pro'.")
-    price_id = STRIPE_PRICE_ID_PRO if tier == "pro" else STRIPE_PRICE_ID
-    if tier == "pro" and not price_id:
-        raise HTTPException(503, "Pro tier isn't configured yet — add STRIPE_PRICE_ID_PRO.")
+    if tier not in ("basic", "pro", "elite"):
+        raise HTTPException(400, "tier must be 'basic', 'pro', or 'elite'.")
+    price_id = STRIPE_PRICE_ID_PRO if tier in ("pro", "elite") else STRIPE_PRICE_ID
+    if tier in ("pro", "elite") and not price_id:
+        raise HTTPException(503, "This tier isn't configured yet — add STRIPE_PRICE_ID_PRO.")
     if len(password) < 8:
         raise HTTPException(400, "Password must be at least 8 characters.")
     existing = sb.table(TABLE_CUST).select("id").eq("email", email).execute()
@@ -207,10 +358,6 @@ async def signup(
     # (fully registered, no A2P propagation delay) over buying fresh.
     pooled = get_warmed_number()
     if pooled:
-        sb.table("recall_number_pool").update({
-            "assigned_to_customer_id": None,  # set to real id after customer row exists, below
-        }).eq("id", pooled["id"]).execute()
-
         class _Purchased:  # shim so the rest of the function can treat this like a fresh purchase
             phone_number = pooled["phone_number"]
             sid = pooled["twilio_sid"]
@@ -246,20 +393,28 @@ async def signup(
             except Exception as e:
                 log.error(f"Failed to add {purchased.phone_number} to A2P sender pool: {e}")
 
-    # 2. Create the customer row (status=trial)
+    # 2. Create the account row (status=trial) — account-level fields only.
     row = {
         "business_name": business_name,
         "owner_name": owner_name,
         "email": email,
         "password_hash": hash_password(password),
-        "business_phone": business_phone,
-        "twilio_number": purchased.phone_number,
         "tier": tier,
     }
-    if reply_template and reply_template.strip():
-        row["reply_template"] = reply_template.strip()
     result = sb.table(TABLE_CUST).insert(row).execute()
     customer = result.data[0]
+
+    # 2b. Create its first location row — this is where the number/config lives.
+    loc_row = {
+        "customer_id": customer["id"],
+        "location_label": "Main location",
+        "business_phone": business_phone,
+        "twilio_number": purchased.phone_number,
+    }
+    if reply_template and reply_template.strip():
+        loc_row["reply_template"] = reply_template.strip()
+    loc_result = sb.table(TABLE_LOC).insert(loc_row).execute()
+    location = loc_result.data[0]
 
     if pooled:
         sb.table("recall_number_pool").update({
@@ -285,6 +440,7 @@ async def signup(
 
     return {
         "customer_id": customer["id"],
+        "location_id": location["id"],
         "token": make_token(customer["id"]),
         "twilio_number_assigned": purchased.phone_number,
         "checkout_url": checkout.url,
@@ -311,9 +467,10 @@ async def login(email: str = Form(...), password: str = Form(...)):
 
 
 # ---------------------------------------------------------------------------
-# TWILIO VOICE WEBHOOK — call hits the dedicated number, we try to dial the
-# real business phone. If nobody picks up, the call ends and /twilio/status
-# fires with an unanswered result, which triggers the text-back.
+# TWILIO VOICE WEBHOOK — call hits a location's dedicated number, we try to
+# dial that location's real business phone. If nobody picks up, the call
+# ends and /twilio/status fires with an unanswered result, triggering the
+# text-back for that specific location.
 # ---------------------------------------------------------------------------
 @app.post("/twilio/voice")
 async def twilio_voice(request: Request):
@@ -321,18 +478,17 @@ async def twilio_voice(request: Request):
     to_number = form.get("To")
 
     resp = VoiceResponse()
-    cust = sb.table(TABLE_CUST).select("*").eq("twilio_number", to_number).execute()
-    if not cust.data:
+    location = get_location_by_number(to_number)
+    if not location:
         resp.say("This number is not currently active.")
         return PlainTextResponse(str(resp), media_type="application/xml")
 
-    customer = cust.data[0]
-    if customer["status"] not in ("trial", "active"):
+    if location["status"] not in ("trial", "active"):
         resp.say("This business is temporarily unavailable. Please try again later.")
         return PlainTextResponse(str(resp), media_type="application/xml")
 
     dial = Dial(timeout=20, action=f"{PUBLIC_BASE_URL}/twilio/dial-result", method="POST")
-    dial.number(customer["business_phone"])
+    dial.number(location["business_phone"])
     resp.append(dial)
     return PlainTextResponse(str(resp), media_type="application/xml")
 
@@ -349,14 +505,13 @@ async def send_missed_call_text(to_number: str, caller: str, call_sid: str):
         if existing.data:
             return  # already texted for this call — avoid double-sending
 
-    cust = sb.table(TABLE_CUST).select("*").eq("twilio_number", to_number).execute()
-    if not cust.data:
+    location = get_location_by_number(to_number)
+    if not location:
         return
-    customer = cust.data[0]
 
-    message = customer["reply_template"].replace("{business_name}", customer["business_name"])
+    message = location["reply_template"].replace("{business_name}", location["business_name"])
     call_row = {
-        "customer_id": customer["id"],
+        "location_id": location["location_id"],
         "caller_number": caller,
         "call_sid": call_sid,
         "sms_body": message,
@@ -473,24 +628,35 @@ async def stripe_webhook(request: Request):
 
 
 # ---------------------------------------------------------------------------
-# SETTINGS — lets a customer view/edit their own auto-reply message without
-# re-signing-up. Same customer_id-as-access-token model as the dashboard.
+# SETTINGS — lets a customer view/edit a location's auto-reply message.
+# Optional location_id (query/form param) selects which location; defaults
+# to the account's primary location if omitted, so old frontend calls keep
+# working unchanged.
 # ---------------------------------------------------------------------------
 MAX_REPLY_LENGTH = 300  # ~2 SMS segments; keeps costs and readability sane
 
 @app.get("/settings/{customer_id}")
-def get_settings(customer_id: str, authorization: str = Header(None)):
+def get_settings(customer_id: str, location_id: str = None, authorization: str = Header(None)):
     require_auth(customer_id, authorization)
-    cust = sb.table(TABLE_CUST).select(
-        "business_name, reply_template"
-    ).eq("id", customer_id).execute()
+    cust = sb.table(TABLE_CUST).select("business_name").eq("id", customer_id).execute()
     if not cust.data:
         raise HTTPException(404, "Not found")
-    return {**cust.data[0], "max_length": MAX_REPLY_LENGTH}
+    loc = get_location_for_customer(customer_id, location_id)
+    return {
+        "business_name": cust.data[0]["business_name"],
+        "reply_template": loc["reply_template"],
+        "location_id": loc["id"],
+        "max_length": MAX_REPLY_LENGTH,
+    }
 
 
 @app.post("/settings/{customer_id}")
-async def update_settings(customer_id: str, reply_template: str = Form(...), authorization: str = Header(None)):
+async def update_settings(
+    customer_id: str,
+    reply_template: str = Form(...),
+    location_id: str = Form(None),
+    authorization: str = Header(None),
+):
     require_auth(customer_id, authorization)
     reply_template = reply_template.strip()
     if not reply_template:
@@ -501,29 +667,30 @@ async def update_settings(customer_id: str, reply_template: str = Form(...), aut
             f"Message is {len(reply_template)} characters — please keep it under {MAX_REPLY_LENGTH} "
             "(longer messages cost more to send and can arrive as multiple texts)."
         )
-    cust = sb.table(TABLE_CUST).select("id").eq("id", customer_id).execute()
-    if not cust.data:
-        raise HTTPException(404, "Not found")
-    sb.table(TABLE_CUST).update({"reply_template": reply_template}).eq("id", customer_id).execute()
-    return {"ok": True, "reply_template": reply_template}
+    loc = get_location_for_customer(customer_id, location_id)
+    sb.table(TABLE_LOC).update({"reply_template": reply_template}).eq("id", loc["id"]).execute()
+    return {"ok": True, "reply_template": reply_template, "location_id": loc["id"]}
 
 
 # ---------------------------------------------------------------------------
 # DASHBOARD API — what the customer sees. Simple, no auth framework yet;
 # customer_id acts as the access token for MVP (fine while trusted/small).
+# Defaults to the primary location if location_id isn't passed, so the
+# existing dashboard.html keeps working without changes.
 # ---------------------------------------------------------------------------
 @app.get("/dashboard/{customer_id}")
-def dashboard(customer_id: str, authorization: str = Header(None)):
+def dashboard(customer_id: str, location_id: str = None, authorization: str = Header(None)):
     require_auth(customer_id, authorization)
     cust = sb.table(TABLE_CUST).select("*").eq("id", customer_id).execute()
     if not cust.data:
         raise HTTPException(404, "Not found")
     customer = cust.data[0]
+    loc = get_location_for_customer(customer_id, location_id)
 
     calls = (
         sb.table(TABLE_CALLS)
         .select("*")
-        .eq("customer_id", customer_id)
+        .eq("location_id", loc["id"])
         .order("called_at", desc=True)
         .limit(50)
         .execute()
@@ -541,12 +708,23 @@ def dashboard(customer_id: str, authorization: str = Header(None)):
         .execute()
     )
 
+    all_locations = (
+        sb.table(TABLE_LOC)
+        .select("id, location_label, twilio_number")
+        .eq("customer_id", customer_id)
+        .order("created_at")
+        .execute()
+    )
+
     return {
         "business_name": customer["business_name"],
         "status": customer["status"],
         "tier": customer.get("tier", "basic"),
-        "twilio_number": customer["twilio_number"],
-        "trial_ends_at": customer["trial_ends_at"],
+        "location_id": loc["id"],
+        "location_label": loc.get("location_label"),
+        "twilio_number": loc["twilio_number"],
+        "locations": all_locations.data,
+        "trial_ends_at": customer.get("trial_ends_at"),
         "stats": {"missed_calls_recent": total, "auto_texts_sent": texted},
         "recent_calls": calls.data,
         "messages": messages.data,
@@ -568,6 +746,7 @@ def resolve_message(message_id: str, customer_id: str = Form(...), authorization
 # and get a real AI answer, grounded in their own uploaded business info.
 # Independent of the ElevenLabs voice AI (Pro/Elite only) since Basic tier
 # has no ElevenLabs setup at all — this uses Claude directly instead.
+# business_info_text and google_calendar_refresh_token now live per-location.
 # ---------------------------------------------------------------------------
 def require_anthropic():
     if not ANTHROPIC_API_KEY:
@@ -575,12 +754,14 @@ def require_anthropic():
 
 
 @app.post("/settings/{customer_id}/business-info")
-async def upload_business_info(customer_id: str, pdf: UploadFile = File(...), authorization: str = Header(None)):
+async def upload_business_info(
+    customer_id: str,
+    pdf: UploadFile = File(...),
+    location_id: str = None,
+    authorization: str = Header(None),
+):
     require_auth(customer_id, authorization)
-    cust = sb.table(TABLE_CUST).select("id, twilio_number").eq("id", customer_id).execute()
-    if not cust.data:
-        raise HTTPException(404, "Not found")
-    customer = cust.data[0]
+    loc = get_location_for_customer(customer_id, location_id)
 
     try:
         import pypdf
@@ -592,29 +773,27 @@ async def upload_business_info(customer_id: str, pdf: UploadFile = File(...), au
     if not text:
         raise HTTPException(400, "Couldn't find any readable text in that PDF.")
 
-    sb.table(TABLE_CUST).update({"business_info_text": text[:20000]}).eq("id", customer_id).execute()
+    sb.table(TABLE_LOC).update({"business_info_text": text[:20000]}).eq("id", loc["id"]).execute()
 
     # Make sure this number can actually receive replies — set the inbound
     # SMS webhook now in case it wasn't set at signup (e.g. older accounts).
-    if twilio_client and customer.get("twilio_number"):
+    if twilio_client and loc.get("twilio_number"):
         try:
-            numbers = twilio_client.incoming_phone_numbers.list(phone_number=customer["twilio_number"], limit=1)
+            numbers = twilio_client.incoming_phone_numbers.list(phone_number=loc["twilio_number"], limit=1)
             if numbers:
                 numbers[0].update(sms_url=f"{PUBLIC_BASE_URL}/twilio/sms", sms_method="POST")
         except Exception as e:
-            log.error(f"Couldn't set sms_url for {customer['twilio_number']}: {e}")
+            log.error(f"Couldn't set sms_url for {loc['twilio_number']}: {e}")
 
-    return {"ok": True, "characters_saved": len(text[:20000])}
+    return {"ok": True, "characters_saved": len(text[:20000]), "location_id": loc["id"]}
 
 
 @app.get("/settings/{customer_id}/business-info")
-def get_business_info(customer_id: str, authorization: str = Header(None)):
+def get_business_info(customer_id: str, location_id: str = None, authorization: str = Header(None)):
     require_auth(customer_id, authorization)
-    cust = sb.table(TABLE_CUST).select("business_info_text").eq("id", customer_id).execute()
-    if not cust.data:
-        raise HTTPException(404, "Not found")
-    text = cust.data[0].get("business_info_text") or ""
-    return {"has_info": bool(text), "preview": text[:200]}
+    loc = get_location_for_customer(customer_id, location_id)
+    text = loc.get("business_info_text") or ""
+    return {"has_info": bool(text), "preview": text[:200], "location_id": loc["id"]}
 
 
 @app.post("/twilio/sms")
@@ -627,31 +806,30 @@ async def twilio_sms(request: Request):
     if not body:
         return PlainTextResponse("", media_type="application/xml")
 
-    cust = sb.table(TABLE_CUST).select("*").eq("twilio_number", to_number).execute()
-    if not cust.data:
+    location = get_location_by_number(to_number)
+    if not location:
         return PlainTextResponse("", media_type="application/xml")
-    customer = cust.data[0]
 
     sb.table("recall_sms_messages").insert({
-        "customer_id": customer["id"], "direction": "inbound",
+        "location_id": location["location_id"], "direction": "inbound",
         "from_number": from_number, "body": body,
     }).execute()
 
     history = (
         sb.table("recall_sms_messages")
         .select("direction, body")
-        .eq("customer_id", customer["id"])
+        .eq("location_id", location["location_id"])
         .order("created_at", desc=True)
         .limit(SMS_HISTORY_LIMIT)
         .execute()
     )
     turns = list(reversed(history.data))
 
-    business_info = customer.get("business_info_text") or "No business information has been provided yet."
-    can_book = customer.get("tier") == "elite" and bool(customer.get("google_calendar_refresh_token"))
+    business_info = location.get("business_info_text") or "No business information has been provided yet."
+    can_book = location.get("tier") == "elite" and bool(location.get("google_calendar_refresh_token"))
 
     system_prompt = (
-        f"You are the text-message assistant for {customer['business_name']}. "
+        f"You are the text-message assistant for {location['business_name']}. "
         "Answer questions using the business info below. Be brief and friendly — "
         "this is a text message, not a phone call, so keep replies short (under "
         "400 characters when possible). If you don't know the answer, say so "
@@ -707,14 +885,14 @@ async def twilio_sms(request: Request):
         try:
             endpoint = "check-availability" if name == "check_availability" else "book-appointment"
             resp = requests.post(
-                f"{PUBLIC_BASE_URL}/tools/{endpoint}/{customer['id']}",
+                f"{PUBLIC_BASE_URL}/tools/{endpoint}/{location['location_id']}",
                 headers={"X-Tool-Secret": ELEVENLABS_TOOL_SECRET, "Content-Type": "application/json"},
                 json=payload,
                 timeout=20,
             )
             return resp.json().get("result", "Something went wrong checking that — try again.")
         except Exception as e:
-            log.error(f"SMS booking tool '{name}' failed for {customer['id']}: {e}")
+            log.error(f"SMS booking tool '{name}' failed for location {location['location_id']}: {e}")
             return "Something went wrong checking that — try again shortly."
 
     try:
@@ -759,26 +937,26 @@ async def twilio_sms(request: Request):
         if not reply_text:
             reply_text = "Got it — let me know if there's anything else I can help with."
     except Exception as e:
-        log.error(f"SMS AI failed for {customer['id']}: {e}")
+        log.error(f"SMS AI failed for location {location['location_id']}: {e}")
         reply_text = "Sorry, I'm having trouble answering right now — please call us directly."
 
     try:
         twilio_client.messages.create(to=from_number, from_=to_number, body=reply_text)
         sb.table("recall_sms_messages").insert({
-            "customer_id": customer["id"], "direction": "outbound",
+            "location_id": location["location_id"], "direction": "outbound",
             "from_number": to_number, "body": reply_text,
         }).execute()
     except Exception as e:
-        log.error(f"SMS AI reply send failed for {customer['id']}: {e}")
+        log.error(f"SMS AI reply send failed for location {location['location_id']}: {e}")
 
     return PlainTextResponse("", media_type="application/xml")
 
 
 # ---------------------------------------------------------------------------
-# APPOINTMENT REMINDERS (Elite tier) — a text sent a set number of minutes
-# before each booked appointment. No background worker runs inside this web
-# service, so this endpoint is meant to be hit on a schedule by an external
-# cron trigger (e.g. cron-job.org, free) every few minutes.
+# APPOINTMENT REMINDERS (Elite tier) — a text/call sent before each booked
+# appointment. recall_appointments now joins through recall_locations for
+# its per-location settings (twilio_number, reminder lead times), and
+# through recall_locations.recall_customers for business_name.
 # ---------------------------------------------------------------------------
 REMINDER_JOB_SECRET = os.environ.get("REMINDER_JOB_SECRET")
 if not REMINDER_JOB_SECRET:
@@ -814,8 +992,8 @@ async def send_reminders(request: Request):
     due = (
         sb.table("recall_appointments")
         .select(
-            "*, recall_customers(business_name, reminder_text_minutes_before, "
-            "reminder_call_minutes_before, twilio_number)"
+            "*, recall_locations(business_name:location_label, reminder_text_minutes_before, "
+            "reminder_call_minutes_before, twilio_number, customer_id, recall_customers(business_name))"
         )
         .or_("reminder_text_sent.eq.false,reminder_call_sent.eq.false")
         .gt("appointment_start", now.isoformat())
@@ -824,9 +1002,11 @@ async def send_reminders(request: Request):
 
     sent = 0
     for appt in due.data:
-        customer = appt.get("recall_customers")
-        if not customer:
+        loc = appt.get("recall_locations")
+        if not loc:
             continue
+        customer_info = loc.get("recall_customers") or {}
+        business_name = customer_info.get("business_name") or loc.get("business_name") or "the business"
         appt_time = datetime.fromisoformat(appt["appointment_start"])
         minutes_until = (appt_time - now).total_seconds() / 60
 
@@ -843,26 +1023,26 @@ async def send_reminders(request: Request):
         local_time = business_local_time_str(appt_time)
         updates = {}
 
-        text_lead = customer.get("reminder_text_minutes_before", 60)
+        text_lead = loc.get("reminder_text_minutes_before", 60)
         if not appt.get("reminder_text_sent") and minutes_until <= text_lead:
             message = (
-                f"Reminder: you have an appointment with {customer['business_name']} "
+                f"Reminder: you have an appointment with {business_name} "
                 f"today at {local_time}. See you soon!"
             )
             try:
                 twilio_client.messages.create(
-                    to=appt["caller_phone"], from_=customer["twilio_number"], body=message
+                    to=appt["caller_phone"], from_=loc["twilio_number"], body=message
                 )
                 updates["reminder_text_sent"] = True
             except Exception as e:
                 log.error(f"Reminder text failed for appointment {appt['id']}: {e}")
 
-        call_lead = customer.get("reminder_call_minutes_before", 15)
+        call_lead = loc.get("reminder_call_minutes_before", 15)
         if not appt.get("reminder_call_sent") and minutes_until <= call_lead:
             try:
                 twilio_client.calls.create(
                     to=appt["caller_phone"],
-                    from_=customer["twilio_number"],
+                    from_=loc["twilio_number"],
                     url=f"{PUBLIC_BASE_URL}/twilio/reminder-twiml/{appt['id']}",
                     method="POST",
                 )
@@ -884,7 +1064,7 @@ async def reminder_twiml(appointment_id: str):
     vr = VoiceResponse()
     appt = (
         sb.table("recall_appointments")
-        .select("*, recall_customers(business_name)")
+        .select("*, recall_locations(recall_customers(business_name))")
         .eq("id", appointment_id)
         .execute()
     )
@@ -893,7 +1073,8 @@ async def reminder_twiml(appointment_id: str):
         return PlainTextResponse(str(vr), media_type="application/xml")
 
     row = appt.data[0]
-    customer = row.get("recall_customers") or {}
+    loc = row.get("recall_locations") or {}
+    customer = loc.get("recall_customers") or {}
     local_time = business_local_time_str(row["appointment_start"])
     business_name = customer.get("business_name", "the business")
     vr.say(
@@ -907,7 +1088,7 @@ async def reminder_twiml(appointment_id: str):
 # NUMBER POOL — keeps a small standing supply of Twilio numbers bought and
 # added to the A2P sender pool WELL BEFORE any customer needs them, since
 # carrier registration propagation can take real hours-to-days. New signups
-# pull an already-warmed number instead of waiting on a fresh one.
+# AND new locations pull an already-warmed number instead of waiting on one.
 # ---------------------------------------------------------------------------
 NUMBER_POOL_TARGET_SIZE = int(os.environ.get("NUMBER_POOL_TARGET_SIZE", "3"))
 NUMBER_POOL_MIN_WARM_HOURS = int(os.environ.get("NUMBER_POOL_MIN_WARM_HOURS", "24"))
@@ -980,8 +1161,10 @@ def get_warmed_number():
 
 
 # ---------------------------------------------------------------------------
-# AI VOICE AGENT (Pro tier) — pick a voice, upload a PDF knowledge base, and
-# wire the customer's Twilio number to an ElevenLabs Conversational AI agent.
+# AI VOICE AGENT (Pro/Elite tier) — pick a voice, upload a PDF knowledge
+# base, and wire a LOCATION's Twilio number to an ElevenLabs Conversational
+# AI agent. Everything here now reads/writes recall_locations, keyed off the
+# account's primary location unless location_id is supplied.
 # ---------------------------------------------------------------------------
 @app.get("/voices")
 def list_voices():
@@ -997,21 +1180,20 @@ def list_voices():
 
 
 @app.get("/agent/{customer_id}")
-def get_agent(customer_id: str, authorization: str = Header(None)):
+def get_agent(customer_id: str, location_id: str = None, authorization: str = Header(None)):
     require_auth(customer_id, authorization)
-    cust = sb.table(TABLE_CUST).select(
-        "tier, elevenlabs_agent_id, elevenlabs_voice_id, elevenlabs_kb_doc_id, fallback_behavior"
-    ).eq("id", customer_id).execute()
+    cust = sb.table(TABLE_CUST).select("tier").eq("id", customer_id).execute()
     if not cust.data:
         raise HTTPException(404, "Not found")
-    row = cust.data[0]
-    if row["tier"] not in ("pro", "elite"):
+    if cust.data[0]["tier"] not in ("pro", "elite"):
         raise HTTPException(403, "This account needs the Pro or Elite tier for the AI voice agent.")
+    loc = get_location_for_customer(customer_id, location_id)
     return {
-        "voice_id": row.get("elevenlabs_voice_id"),
-        "has_pdf": bool(row.get("elevenlabs_kb_doc_id")),
-        "agent_configured": bool(row.get("elevenlabs_agent_id")),
-        "fallback_behavior": row.get("fallback_behavior", "message"),
+        "location_id": loc["id"],
+        "voice_id": loc.get("elevenlabs_voice_id"),
+        "has_pdf": bool(loc.get("elevenlabs_kb_doc_id")),
+        "agent_configured": bool(loc.get("elevenlabs_agent_id")),
+        "fallback_behavior": loc.get("fallback_behavior", "message"),
     }
 
 
@@ -1020,6 +1202,7 @@ async def setup_agent(
     customer_id: str,
     voice_id: str = Form(...),
     fallback_behavior: str = Form("message"),  # "message" | "transfer" | "try_harder"
+    location_id: str = Form(None),
     pdf: UploadFile = File(None),
     authorization: str = Header(None),
 ):
@@ -1036,18 +1219,19 @@ async def setup_agent(
     customer = cust.data[0]
     if customer["tier"] not in ("pro", "elite"):
         raise HTTPException(403, "This account needs the Pro or Elite tier — upgrade to use the AI voice agent.")
+    location = get_location_for_customer(customer_id, location_id)
 
     update = {"elevenlabs_voice_id": voice_id, "fallback_behavior": fallback_behavior}
 
     # 1. Upload the PDF as a knowledge base document, if one was provided.
-    kb_doc_id = customer.get("elevenlabs_kb_doc_id")
+    kb_doc_id = location.get("elevenlabs_kb_doc_id")
     if pdf is not None:
         files = {"file": (pdf.filename, await pdf.read(), pdf.content_type or "application/pdf")}
         resp = requests.post(
             f"{ELEVENLABS_BASE}/convai/knowledge-base/file",
             headers=el_headers(),
             files=files,
-            data={"name": f"{customer['business_name']} info"},
+            data={"name": f"{customer['business_name']} — {location.get('location_label', 'info')}"},
             timeout=60,
         )
         if not resp.ok:
@@ -1055,8 +1239,8 @@ async def setup_agent(
         kb_doc_id = resp.json().get("id")
         update["elevenlabs_kb_doc_id"] = kb_doc_id
 
-    # 2. Create or update the ElevenLabs agent for this business.
-    transfer_target = customer.get("transfer_phone") or customer.get("business_phone")
+    # 2. Create or update the ElevenLabs agent for this location.
+    transfer_target = location.get("transfer_phone") or location.get("business_phone")
     fallback_instructions = {
         "message": "If you don't know the answer, politely ask for their name and phone number, then call take_message with those details so someone actually gets notified — don't just say you'll pass it along without calling the tool.",
         "transfer": "If you don't know the answer, offer to connect them to a person using your transfer ability.",
@@ -1080,7 +1264,7 @@ async def setup_agent(
             "any of those without having called it, call it first. Do not narrate a transfer that "
             "hasn't actually happened."
         )
-    calendar_connected = customer.get("tier") == "elite" and customer.get("google_calendar_connected")
+    calendar_connected = customer.get("tier") == "elite" and location.get("google_calendar_connected")
     if calendar_connected:
         from zoneinfo import ZoneInfo
         today_str = datetime.now(ZoneInfo(BUSINESS_TZ)).strftime("%A, %B %d, %Y")
@@ -1116,6 +1300,8 @@ async def setup_agent(
             {"id": kb_doc_id, "type": "file", "name": f"{customer['business_name']} info"}
         ]
 
+    # Tool URLs now key off location_id, not customer_id, since a call comes
+    # in on a specific location's number.
     webhook_tools = []
     tool_secret_header = {"X-Tool-Secret": ELEVENLABS_TOOL_SECRET}
     if calendar_connected:
@@ -1125,7 +1311,7 @@ async def setup_agent(
                 "name": "check_availability",
                 "description": "Check whether a specific time is open on a given date. Always pass 'time' when the caller mentions a specific time (e.g. '3pm') so it checks that exact slot — don't omit it and just browse the morning.",
                 "api_schema": {
-                    "url": f"{PUBLIC_BASE_URL}/tools/check-availability/{customer_id}",
+                    "url": f"{PUBLIC_BASE_URL}/tools/check-availability/{location['id']}",
                     "method": "POST",
                     "request_headers": tool_secret_header,
                     "request_body_schema": {
@@ -1143,7 +1329,7 @@ async def setup_agent(
                 "name": "book_appointment",
                 "description": "Book an appointment on the business's calendar once the caller confirms a date and time.",
                 "api_schema": {
-                    "url": f"{PUBLIC_BASE_URL}/tools/book-appointment/{customer_id}",
+                    "url": f"{PUBLIC_BASE_URL}/tools/book-appointment/{location['id']}",
                     "method": "POST",
                     "request_headers": tool_secret_header,
                     "request_body_schema": {
@@ -1164,7 +1350,7 @@ async def setup_agent(
         "name": "take_message",
         "description": "Log a callback request when you can't help the caller directly — always call this rather than just telling the caller you'll pass their info along.",
         "api_schema": {
-            "url": f"{PUBLIC_BASE_URL}/tools/take-message/{customer_id}",
+            "url": f"{PUBLIC_BASE_URL}/tools/take-message/{location['id']}",
             "method": "POST",
             "request_headers": tool_secret_header,
             "request_body_schema": {
@@ -1184,7 +1370,7 @@ async def setup_agent(
             "name": "notify_owner",
             "description": "Send a text heads-up to the business before transferring a call to them — call this right before connecting the caller, always.",
             "api_schema": {
-                "url": f"{PUBLIC_BASE_URL}/tools/notify-owner/{customer_id}",
+                "url": f"{PUBLIC_BASE_URL}/tools/notify-owner/{location['id']}",
                 "method": "POST",
                 "request_headers": tool_secret_header,
                 "request_body_schema": {
@@ -1221,12 +1407,13 @@ async def setup_agent(
             r = requests.post(
                 f"{ELEVENLABS_BASE}/convai/agents/create",
                 headers={**el_headers(), "Content-Type": "application/json"},
-                json={"name": customer["business_name"], "conversation_config": conversation_config},
+                json={"name": f"{customer['business_name']} — {location.get('location_label', '')}".strip(" —"),
+                      "conversation_config": conversation_config},
                 timeout=30,
             )
         return r
 
-    agent_id = customer.get("elevenlabs_agent_id")
+    agent_id = location.get("elevenlabs_agent_id")
     resp = save_agent(agent_id)
     if not resp.ok:
         raise HTTPException(502, f"Couldn't save ElevenLabs agent: {resp.text[:300]}")
@@ -1234,16 +1421,17 @@ async def setup_agent(
         agent_id = resp.json().get("agent_id")
         update["elevenlabs_agent_id"] = agent_id
 
-    # 3. Import the Twilio number into ElevenLabs (first time only) and assign the agent.
-    phone_id = customer.get("elevenlabs_phone_id")
+    # 3. Import the location's Twilio number into ElevenLabs (first time
+    # only) and assign the agent.
+    phone_id = location.get("elevenlabs_phone_id")
     if not phone_id:
         resp = requests.post(
             f"{ELEVENLABS_BASE}/convai/phone-numbers",
             headers={**el_headers(), "Content-Type": "application/json"},
             json={
                 "provider": "twilio",
-                "phone_number": customer["twilio_number"],
-                "label": customer["business_name"],
+                "phone_number": location["twilio_number"],
+                "label": f"{customer['business_name']} — {location.get('location_label', '')}".strip(" —"),
                 "sid": TWILIO_SID,
                 "token": TWILIO_TOKEN,
             },
@@ -1272,17 +1460,17 @@ async def setup_agent(
     # import may have overwritten it. This is what lets send_missed_call_text
     # fire as a safety net even when ElevenLabs owns the voice webhook.
     try:
-        numbers = twilio_client.incoming_phone_numbers.list(phone_number=customer["twilio_number"], limit=1)
+        numbers = twilio_client.incoming_phone_numbers.list(phone_number=location["twilio_number"], limit=1)
         if numbers:
             numbers[0].update(
                 status_callback=f"{PUBLIC_BASE_URL}/twilio/status",
                 status_callback_method="POST",
             )
     except Exception as e:
-        log.error(f"Couldn't re-apply status callback for {customer['twilio_number']}: {e}")
+        log.error(f"Couldn't re-apply status callback for {location['twilio_number']}: {e}")
 
-    sb.table(TABLE_CUST).update(update).eq("id", customer_id).execute()
-    return {"ok": True, "agent_id": agent_id, "voice_id": voice_id, "has_pdf": bool(kb_doc_id)}
+    sb.table(TABLE_LOC).update(update).eq("id", location["id"]).execute()
+    return {"ok": True, "location_id": location["id"], "agent_id": agent_id, "voice_id": voice_id, "has_pdf": bool(kb_doc_id)}
 
 
 # ---------------------------------------------------------------------------
@@ -1291,6 +1479,8 @@ async def setup_agent(
 # customer authorizes their own Google account via the real Google consent
 # screen. We never see or store their Google password — only a refresh token
 # scoped to whichever single permission (calendar or business) they granted.
+# Tokens are stored per-LOCATION now, since a multi-location Elite account
+# may connect a different Calendar/listing for each site.
 # ---------------------------------------------------------------------------
 def require_google():
     if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
@@ -1303,7 +1493,7 @@ def require_elite(customer: dict):
 
 
 @app.get("/google/auth-url")
-def google_auth_url(customer_id: str, service: str, authorization: str = Header(None)):
+def google_auth_url(customer_id: str, service: str, location_id: str = None, authorization: str = Header(None)):
     require_auth(customer_id, authorization)
     require_google()
     if service not in GOOGLE_SCOPES:
@@ -1313,11 +1503,17 @@ def google_auth_url(customer_id: str, service: str, authorization: str = Header(
     if not cust.data:
         raise HTTPException(404, "Not found")
     require_elite(cust.data[0])
+    location = get_location_for_customer(customer_id, location_id)
 
-    # Short-lived signed state — carries which customer/service this is for
+    # Short-lived signed state — carries which location/service this is for
     # through Google's redirect, since Google can't send our auth header back.
     state = jwt.encode(
-        {"customer_id": customer_id, "service": service, "exp": datetime.now(timezone.utc) + timedelta(minutes=10)},
+        {
+            "customer_id": customer_id,
+            "location_id": location["id"],
+            "service": service,
+            "exp": datetime.now(timezone.utc) + timedelta(minutes=10),
+        },
         JWT_SECRET,
         algorithm="HS256",
     )
@@ -1345,6 +1541,7 @@ def google_callback(code: str = None, state: str = None, error: str = None):
         raise HTTPException(400, "This connection link expired or is invalid — go back and try connecting again.")
 
     customer_id = payload["customer_id"]
+    location_id = payload["location_id"]
     service = payload["service"]
 
     token_resp = requests.post(
@@ -1366,32 +1563,39 @@ def google_callback(code: str = None, state: str = None, error: str = None):
     if refresh_token:
         col = "google_calendar_refresh_token" if service == "calendar" else "google_business_refresh_token"
         flag = "google_calendar_connected" if service == "calendar" else "google_business_connected"
-        sb.table(TABLE_CUST).update({col: refresh_token, flag: True}).eq("id", customer_id).execute()
+        sb.table(TABLE_LOC).update({col: refresh_token, flag: True}).eq("id", location_id).execute()
 
     from fastapi.responses import RedirectResponse
-    return RedirectResponse(f"{FRONTEND_BASE_URL}/elite-setup.html?customer_id={customer_id}&connected={service}")
+    return RedirectResponse(
+        f"{FRONTEND_BASE_URL}/elite-setup.html?customer_id={customer_id}&location_id={location_id}&connected={service}"
+    )
 
 
 @app.get("/elite/{customer_id}")
-def get_elite_status(customer_id: str, authorization: str = Header(None)):
+def get_elite_status(customer_id: str, location_id: str = None, authorization: str = Header(None)):
     require_auth(customer_id, authorization)
-    cust = sb.table(TABLE_CUST).select(
-        "tier, google_calendar_connected, google_business_connected, booking_hours_start, booking_hours_end"
-    ).eq("id", customer_id).execute()
+    cust = sb.table(TABLE_CUST).select("tier").eq("id", customer_id).execute()
     if not cust.data:
         raise HTTPException(404, "Not found")
-    row = cust.data[0]
-    require_elite(row)
+    require_elite(cust.data[0])
+    loc = get_location_for_customer(customer_id, location_id)
     return {
-        "calendar_connected": row.get("google_calendar_connected", False),
-        "business_connected": row.get("google_business_connected", False),
-        "booking_hours_start": row.get("booking_hours_start", DEFAULT_BUSINESS_HOURS[0]),
-        "booking_hours_end": row.get("booking_hours_end", DEFAULT_BUSINESS_HOURS[1]),
+        "location_id": loc["id"],
+        "calendar_connected": loc.get("google_calendar_connected", False),
+        "business_connected": loc.get("google_business_connected", False),
+        "booking_hours_start": loc.get("booking_hours_start", DEFAULT_BUSINESS_HOURS[0]),
+        "booking_hours_end": loc.get("booking_hours_end", DEFAULT_BUSINESS_HOURS[1]),
     }
 
 
 @app.post("/elite/{customer_id}/hours")
-async def update_booking_hours(customer_id: str, hours_start: int = Form(...), hours_end: int = Form(...), authorization: str = Header(None)):
+async def update_booking_hours(
+    customer_id: str,
+    hours_start: int = Form(...),
+    hours_end: int = Form(...),
+    location_id: str = Form(None),
+    authorization: str = Header(None),
+):
     require_auth(customer_id, authorization)
     if not (0 <= hours_start < hours_end <= 24):
         raise HTTPException(400, "Hours must be 0-24, and start must be before end.")
@@ -1399,18 +1603,19 @@ async def update_booking_hours(customer_id: str, hours_start: int = Form(...), h
     if not cust.data:
         raise HTTPException(404, "Not found")
     require_elite(cust.data[0])
-    sb.table(TABLE_CUST).update(
+    loc = get_location_for_customer(customer_id, location_id)
+    sb.table(TABLE_LOC).update(
         {"booking_hours_start": hours_start, "booking_hours_end": hours_end}
-    ).eq("id", customer_id).execute()
-    return {"ok": True, "booking_hours_start": hours_start, "booking_hours_end": hours_end}
+    ).eq("id", loc["id"]).execute()
+    return {"ok": True, "location_id": loc["id"], "booking_hours_start": hours_start, "booking_hours_end": hours_end}
 
 
 # ---------------------------------------------------------------------------
 # CALENDAR TOOL ENDPOINTS — called live, mid-call, by the ElevenLabs agent
 # (not by the browser). Protected by a shared secret header instead of the
 # customer's login token, since ElevenLabs' servers are the caller here.
-# Fallback default if a customer hasn't set their own hours — actual hours
-# are stored per-customer (booking_hours_start/end) and used below.
+# Now keyed by location_id (a call comes in on a specific location's
+# number), not customer_id.
 # ---------------------------------------------------------------------------
 BUSINESS_TZ = "America/New_York"
 DEFAULT_BUSINESS_HOURS = (9, 17)  # 9am–5pm
@@ -1439,18 +1644,20 @@ def google_access_token(refresh_token: str) -> str:
     return resp.json()["access_token"]
 
 
-def get_calendar_customer(customer_id: str) -> dict:
-    cust = sb.table(TABLE_CUST).select("*").eq("id", customer_id).execute()
-    if not cust.data:
-        raise HTTPException(404, "Customer not found")
-    customer = cust.data[0]
-    if not customer.get("google_calendar_refresh_token"):
-        raise HTTPException(400, "Google Calendar isn't connected for this business.")
-    return customer
+def get_calendar_location(location_id: str) -> dict:
+    loc = sb.table(TABLE_LOC).select("*, recall_customers(business_name)").eq("id", location_id).execute()
+    if not loc.data:
+        raise HTTPException(404, "Location not found")
+    row = loc.data[0]
+    customer = row.pop("recall_customers", None) or {}
+    merged = {**customer, **row}
+    if not merged.get("google_calendar_refresh_token"):
+        raise HTTPException(400, "Google Calendar isn't connected for this location.")
+    return merged
 
 
-@app.post("/tools/check-availability/{customer_id}")
-async def tool_check_availability(customer_id: str, request: Request):
+@app.post("/tools/check-availability/{location_id}")
+async def tool_check_availability(location_id: str, request: Request):
     check_tool_secret({k.lower(): v for k, v in request.headers.items()})
     body = await request.json()
     log.info(f"check-availability request body: {body}")
@@ -1460,16 +1667,16 @@ async def tool_check_availability(customer_id: str, request: Request):
         return {"result": "I need a specific date (YYYY-MM-DD) to check availability."}
 
     try:
-        customer = get_calendar_customer(customer_id)
-        hours_start = customer.get("booking_hours_start", DEFAULT_BUSINESS_HOURS[0])
-        hours_end = customer.get("booking_hours_end", DEFAULT_BUSINESS_HOURS[1])
+        location = get_calendar_location(location_id)
+        hours_start = location.get("booking_hours_start", DEFAULT_BUSINESS_HOURS[0])
+        hours_end = location.get("booking_hours_end", DEFAULT_BUSINESS_HOURS[1])
         from zoneinfo import ZoneInfo
         tz = ZoneInfo(BUSINESS_TZ)
         day = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=tz)
         day_start = day.replace(hour=hours_start, minute=0, second=0, microsecond=0)
         day_end = day_start + timedelta(hours=(hours_end - hours_start))  # handles hours_end=24 (midnight) safely
 
-        access_token = google_access_token(customer["google_calendar_refresh_token"])
+        access_token = google_access_token(location["google_calendar_refresh_token"])
         resp = requests.post(
             "https://www.googleapis.com/calendar/v3/freeBusy",
             headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
@@ -1481,7 +1688,7 @@ async def tool_check_availability(customer_id: str, request: Request):
             timeout=20,
         )
         if not resp.ok:
-            log.error(f"Google freeBusy failed for {customer_id}: {resp.status_code} {resp.text[:400]}")
+            log.error(f"Google freeBusy failed for location {location_id}: {resp.status_code} {resp.text[:400]}")
             return {"result": "I couldn't check the calendar right now — please offer to take a message instead."}
 
         busy = resp.json().get("calendars", {}).get("primary", {}).get("busy", [])
@@ -1527,12 +1734,12 @@ async def tool_check_availability(customer_id: str, request: Request):
     except ValueError:
         return {"result": "That date didn't look right — please use YYYY-MM-DD format."}
     except Exception:
-        log.exception(f"check-availability crashed for {customer_id}")
+        log.exception(f"check-availability crashed for location {location_id}")
         return {"result": "I couldn't check the calendar right now — please offer to take a message instead."}
 
 
-@app.post("/tools/book-appointment/{customer_id}")
-async def tool_book_appointment(customer_id: str, request: Request):
+@app.post("/tools/book-appointment/{location_id}")
+async def tool_book_appointment(location_id: str, request: Request):
     check_tool_secret({k.lower(): v for k, v in request.headers.items()})
     body = await request.json()
     log.info(f"book-appointment request body: {body}")
@@ -1543,9 +1750,9 @@ async def tool_book_appointment(customer_id: str, request: Request):
         return {"result": "I'm missing some details — I need the date, time, the caller's name, and their phone number."}
 
     try:
-        customer = get_calendar_customer(customer_id)
-        hours_start = customer.get("booking_hours_start", DEFAULT_BUSINESS_HOURS[0])
-        hours_end = customer.get("booking_hours_end", DEFAULT_BUSINESS_HOURS[1])
+        location = get_calendar_location(location_id)
+        hours_start = location.get("booking_hours_start", DEFAULT_BUSINESS_HOURS[0])
+        hours_end = location.get("booking_hours_end", DEFAULT_BUSINESS_HOURS[1])
         from zoneinfo import ZoneInfo
         tz = ZoneInfo(BUSINESS_TZ)
         start = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=tz)
@@ -1555,12 +1762,12 @@ async def tool_book_appointment(customer_id: str, request: Request):
         if not (day_start <= start and end <= day_end):
             return {"result": f"That time is outside booking hours ({hours_start}:00–{hours_end}:00) — offer a time within that window."}
 
-        access_token = google_access_token(customer["google_calendar_refresh_token"])
+        access_token = google_access_token(location["google_calendar_refresh_token"])
         resp = requests.post(
             "https://www.googleapis.com/calendar/v3/calendars/primary/events",
             headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
             json={
-                "summary": f"{caller_name} — {customer['business_name']} appointment",
+                "summary": f"{caller_name} — {location['business_name']} appointment",
                 "description": f"Booked by Recall AI. Caller phone: {caller_phone}",
                 "start": {"dateTime": start.isoformat()},
                 "end": {"dateTime": end.isoformat()},
@@ -1568,13 +1775,13 @@ async def tool_book_appointment(customer_id: str, request: Request):
             timeout=20,
         )
         if not resp.ok:
-            log.error(f"Google event creation failed for {customer_id}: {resp.status_code} {resp.text[:400]}")
+            log.error(f"Google event creation failed for location {location_id}: {resp.status_code} {resp.text[:400]}")
             return {"result": "I couldn't book that — please offer to take a message instead."}
         log.info(f"book-appointment success, event id: {resp.json().get('id')}")
 
         try:
             sb.table("recall_appointments").insert({
-                "customer_id": customer_id,
+                "location_id": location_id,
                 "caller_name": caller_name,
                 "caller_phone": caller_phone,
                 "appointment_start": start.isoformat(),
@@ -1582,18 +1789,18 @@ async def tool_book_appointment(customer_id: str, request: Request):
         except Exception as e:
             # Booking itself already succeeded on the real calendar — don't
             # fail the whole tool call just because the reminder record failed.
-            log.error(f"Couldn't save appointment record for reminders ({customer_id}): {e}")
+            log.error(f"Couldn't save appointment record for reminders (location {location_id}): {e}")
 
         return {"result": f"Booked for {caller_name} on {date_str} at {time_str}. Confirmed."}
     except ValueError:
         return {"result": "That date or time didn't look right — date as YYYY-MM-DD, time as HH:MM."}
     except Exception:
-        log.exception(f"book-appointment crashed for {customer_id}")
+        log.exception(f"book-appointment crashed for location {location_id}")
         return {"result": "I couldn't book that — please offer to take a message instead."}
 
 
-@app.post("/tools/notify-owner/{customer_id}")
-async def tool_notify_owner(customer_id: str, request: Request):
+@app.post("/tools/notify-owner/{location_id}")
+async def tool_notify_owner(location_id: str, request: Request):
     """Called by the AI right before it transfers a call, so the owner gets a
     text heads-up even if they don't pick up the actual transferred call —
     a live warm-transfer message only reaches them if they answer; this
@@ -1604,33 +1811,36 @@ async def tool_notify_owner(customer_id: str, request: Request):
     is_emergency = bool(p.get("is_emergency"))
     reason = (p.get("reason") or "").strip()
 
-    cust = sb.table(TABLE_CUST).select("*").eq("id", customer_id).execute()
-    if not cust.data:
+    loc = sb.table(TABLE_LOC).select("*, recall_customers(business_name)").eq("id", location_id).execute()
+    if not loc.data:
         return {"result": "Couldn't send the notification — proceed with the transfer anyway."}
-    customer = cust.data[0]
-    target = customer.get("transfer_phone") or customer.get("business_phone")
+    row = loc.data[0]
+    customer = row.pop("recall_customers", None) or {}
+    location = {**customer, **row}
+    target = location.get("transfer_phone") or location.get("business_phone")
     if not target:
         return {"result": "No transfer contact number is configured — proceed with the transfer anyway."}
 
+    business_name = location.get("business_name", "the business")
     if is_emergency:
-        message = f"🚨 URGENT call for {customer['business_name']} being connected to you now"
+        message = f"🚨 URGENT call for {business_name} being connected to you now"
     else:
-        message = f"Heads up: a caller is being connected to you now for {customer['business_name']}"
+        message = f"Heads up: a caller is being connected to you now for {business_name}"
     if reason:
         message += f" — {reason}."
     else:
         message += "."
 
     try:
-        twilio_client.messages.create(to=target, from_=customer["twilio_number"], body=message)
+        twilio_client.messages.create(to=target, from_=location["twilio_number"], body=message)
         return {"result": "Notified. Proceed with the transfer."}
     except Exception as e:
-        log.error(f"notify-owner SMS failed for {customer_id}: {e}")
+        log.error(f"notify-owner SMS failed for location {location_id}: {e}")
         return {"result": "Notification failed to send — proceed with the transfer anyway."}
 
 
-@app.post("/tools/take-message/{customer_id}")
-async def tool_take_message(customer_id: str, request: Request):
+@app.post("/tools/take-message/{location_id}")
+async def tool_take_message(location_id: str, request: Request):
     """Called when the AI can't help and needs to take a callback message.
     Stores it AND texts the owner immediately — previously the AI would only
     say 'I'll pass this along' with nothing actually behind that promise."""
@@ -1643,31 +1853,33 @@ async def tool_take_message(customer_id: str, request: Request):
     if not caller_phone:
         return {"result": "I need a callback phone number before I can log this."}
 
-    cust = sb.table(TABLE_CUST).select("*").eq("id", customer_id).execute()
-    if not cust.data:
+    loc = sb.table(TABLE_LOC).select("*, recall_customers(business_name)").eq("id", location_id).execute()
+    if not loc.data:
         return {"result": "Couldn't save that message — apologize and let them know someone will follow up."}
-    customer = cust.data[0]
+    row = loc.data[0]
+    customer = row.pop("recall_customers", None) or {}
+    location = {**customer, **row}
 
     try:
         sb.table("recall_messages").insert({
-            "customer_id": customer_id,
+            "customer_id": location["customer_id"],
             "caller_name": caller_name or None,
             "caller_phone": caller_phone,
             "note": note or None,
         }).execute()
     except Exception as e:
-        log.error(f"take-message save failed for {customer_id}: {e}")
+        log.error(f"take-message save failed for location {location_id}: {e}")
         return {"result": "Couldn't save that message — apologize and let them know someone will follow up."}
 
-    target = customer.get("transfer_phone") or customer.get("business_phone")
+    target = location.get("transfer_phone") or location.get("business_phone")
     if target:
-        sms = f"📋 Callback request for {customer['business_name']}: {caller_name or 'no name given'}, {caller_phone}"
+        sms = f"📋 Callback request for {location.get('business_name', 'your business')}: {caller_name or 'no name given'}, {caller_phone}"
         if note:
             sms += f" — {note}"
         try:
-            twilio_client.messages.create(to=target, from_=customer["twilio_number"], body=sms)
+            twilio_client.messages.create(to=target, from_=location["twilio_number"], body=sms)
         except Exception as e:
-            log.error(f"take-message owner SMS failed for {customer_id}: {e}")
+            log.error(f"take-message owner SMS failed for location {location_id}: {e}")
 
     return {"result": "Logged. Let the caller know someone will follow up soon."}
 
@@ -1676,7 +1888,7 @@ async def tool_take_message(customer_id: str, request: Request):
 # NUMBER SETUP OPTIONS — a customer can either forward their existing number
 # to the AI's Twilio number (instant, self-serve) or request a full port-in
 # (their real number moves into Twilio — takes days to weeks, can be
-# rejected, requires carrier account details).
+# rejected, requires carrier account details). Per-location now.
 # ---------------------------------------------------------------------------
 
 FORWARDING_CARRIERS = {
@@ -1690,23 +1902,21 @@ FORWARDING_CARRIERS = {
 
 
 @app.get("/setup/forwarding-instructions/{customer_id}")
-def forwarding_instructions(customer_id: str, carrier: str = "other", authorization: str = Header(None)):
+def forwarding_instructions(customer_id: str, carrier: str = "other", location_id: str = None, authorization: str = Header(None)):
     require_auth(customer_id, authorization)
-    cust = sb.table(TABLE_CUST).select("twilio_number, transfer_phone, business_phone").eq("id", customer_id).execute()
-    if not cust.data:
-        raise HTTPException(404, "Not found")
+    loc = get_location_for_customer(customer_id, location_id)
     info = FORWARDING_CARRIERS.get(carrier, FORWARDING_CARRIERS["other"])
-    row = cust.data[0]
-    ai_number = row["twilio_number"]
+    ai_number = loc["twilio_number"]
     ten_digit = ai_number[2:] if ai_number.startswith("+1") else ai_number
     return {
+        "location_id": loc["id"],
         "carrier": info["label"],
         "ai_number": ai_number,
         "activate_code": info["activate_fmt"].format(n=ten_digit),
         "deactivate_code": info["deactivate"],
         "instructions": info["note"],
         "caveat": "This only forwards calls, not texts — your AI number handles texts either way. Some very basic landline plans need a small add-on from the carrier to enable forwarding at all.",
-        "current_transfer_phone": row.get("transfer_phone") or row.get("business_phone"),
+        "current_transfer_phone": loc.get("transfer_phone") or loc.get("business_phone"),
     }
 
 
@@ -1725,15 +1935,19 @@ async def set_transfer_phone(customer_id: str, request: Request, authorization: 
     """The number a customer is forwarding to their AI line — used for live
     call transfers and emergency/callback SMS. Deliberately separate from
     business_phone (which is just the signup contact) since a customer may
-    forward a completely different line than the one they signed up with."""
+    forward a completely different line than the one they signed up with.
+    Per-location; pass location_id in the JSON body for a multi-location
+    account, else it applies to the primary location."""
     require_auth(customer_id, authorization)
     body = await request.json()
     raw = (body.get("transfer_phone") or "").strip()
     if not raw:
         raise HTTPException(400, "Missing transfer_phone.")
     e164 = normalize_us_phone(raw)
-    sb.table(TABLE_CUST).update({"transfer_phone": e164}).eq("id", customer_id).execute()
+    loc = get_location_for_customer(customer_id, body.get("location_id"))
+    sb.table(TABLE_LOC).update({"transfer_phone": e164}).eq("id", loc["id"]).execute()
     return {
+        "location_id": loc["id"],
         "transfer_phone": e164,
         "note": (
             "If your AI voice agent is already set up, re-save it on the AI voice agent "
