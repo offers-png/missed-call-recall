@@ -324,6 +324,47 @@ async def add_location(
     }
 
 
+@app.post("/locations/{location_id}/delete")
+def delete_location(location_id: str, customer_id: str = Form(...), authorization: str = Header(None)):
+    """Deletes a location and releases its Twilio number. Refuses to delete
+    an account's LAST location — that's not "delete a location," that's
+    "reset the whole account," and needs to never happen by accident from
+    a delete button."""
+    require_auth(customer_id, authorization)
+
+    loc = sb.table(TABLE_LOC).select("*").eq("id", location_id).execute()
+    if not loc.data or loc.data[0]["customer_id"] != customer_id:
+        raise HTTPException(404, "Location not found for this account.")
+    location = loc.data[0]
+
+    all_locs = sb.table(TABLE_LOC).select("id").eq("customer_id", customer_id).execute()
+    if len(all_locs.data) <= 1:
+        raise HTTPException(
+            400,
+            "Can't delete your only location — that would leave the account with no number at "
+            "all. Add another location first if you want to replace this one."
+        )
+
+    twilio_number = location.get("twilio_number")
+    if twilio_number and twilio_client is not None:
+        try:
+            matches = twilio_client.incoming_phone_numbers.list(phone_number=twilio_number, limit=1)
+            if matches:
+                matches[0].delete()
+        except Exception as e:
+            log.error(f"Couldn't release {twilio_number} from Twilio while deleting location {location_id}: {e}")
+
+    agent_id = location.get("elevenlabs_agent_id")
+    if agent_id and ELEVENLABS_API_KEY:
+        try:
+            requests.delete(f"{ELEVENLABS_BASE}/convai/agents/{agent_id}", headers=el_headers(), timeout=20)
+        except Exception as e:
+            log.error(f"Couldn't delete ElevenLabs agent {agent_id} while deleting location {location_id}: {e}")
+
+    sb.table(TABLE_LOC).delete().eq("id", location_id).execute()
+    return {"ok": True, "deleted_location_id": location_id, "released_number": twilio_number}
+
+
 # ---------------------------------------------------------------------------
 # SIGNUP — creates the ACCOUNT (email/password/Stripe/tier) plus its first
 # location (Twilio number + business phone). This is the only place email
