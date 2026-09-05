@@ -325,11 +325,17 @@ async def add_location(
 
 
 @app.post("/locations/{location_id}/delete")
-def delete_location(location_id: str, customer_id: str = Form(...), authorization: str = Header(None)):
-    """Deletes a location and releases its Twilio number. Refuses to delete
-    an account's LAST location — that's not "delete a location," that's
-    "reset the whole account," and needs to never happen by accident from
-    a delete button."""
+def delete_location(location_id: str, customer_id: str = Form(...), permanent: bool = Form(True), authorization: str = Header(None)):
+    """Removes a location. Two modes:
+    - permanent=True (default): releases the Twilio number and deletes the
+      ElevenLabs agent too — irreversible, matches manually deleting them
+      in those consoles.
+    - permanent=False: only removes the location from Recall. The Twilio
+      number and ElevenLabs agent are left exactly as they are, so the same
+      number can be reattached to a new location later without buying a
+      fresh one — useful while testing.
+    Either way, refuses to delete an account's LAST location — that's not
+    "delete a location," that's "reset the whole account.\""""
     require_auth(customer_id, authorization)
 
     loc = sb.table(TABLE_LOC).select("*").eq("id", location_id).execute()
@@ -346,23 +352,31 @@ def delete_location(location_id: str, customer_id: str = Form(...), authorizatio
         )
 
     twilio_number = location.get("twilio_number")
-    if twilio_number and twilio_client is not None:
-        try:
-            matches = twilio_client.incoming_phone_numbers.list(phone_number=twilio_number, limit=1)
-            if matches:
-                matches[0].delete()
-        except Exception as e:
-            log.error(f"Couldn't release {twilio_number} from Twilio while deleting location {location_id}: {e}")
-
     agent_id = location.get("elevenlabs_agent_id")
-    if agent_id and ELEVENLABS_API_KEY:
-        try:
-            requests.delete(f"{ELEVENLABS_BASE}/convai/agents/{agent_id}", headers=el_headers(), timeout=20)
-        except Exception as e:
-            log.error(f"Couldn't delete ElevenLabs agent {agent_id} while deleting location {location_id}: {e}")
+
+    if permanent:
+        if twilio_number and twilio_client is not None:
+            try:
+                matches = twilio_client.incoming_phone_numbers.list(phone_number=twilio_number, limit=1)
+                if matches:
+                    matches[0].delete()
+            except Exception as e:
+                log.error(f"Couldn't release {twilio_number} from Twilio while deleting location {location_id}: {e}")
+
+        if agent_id and ELEVENLABS_API_KEY:
+            try:
+                requests.delete(f"{ELEVENLABS_BASE}/convai/agents/{agent_id}", headers=el_headers(), timeout=20)
+            except Exception as e:
+                log.error(f"Couldn't delete ElevenLabs agent {agent_id} while deleting location {location_id}: {e}")
 
     sb.table(TABLE_LOC).delete().eq("id", location_id).execute()
-    return {"ok": True, "deleted_location_id": location_id, "released_number": twilio_number}
+    return {
+        "ok": True,
+        "deleted_location_id": location_id,
+        "permanent": permanent,
+        "released_number": twilio_number if permanent else None,
+        "kept_number": None if permanent else twilio_number,
+    }
 
 
 # ---------------------------------------------------------------------------
