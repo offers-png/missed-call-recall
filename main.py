@@ -1396,14 +1396,15 @@ async def setup_agent(
             "request_headers": tool_secret_header,
             "request_body_schema": {
                 "type": "object",
-                "properties": [
-                    {"id": "caller_name", "type": "string", "value_type": "llm_prompt",
-                     "description": "The caller's name, if given", "required": False},
-                    {"id": "caller_phone", "type": "string", "value_type": "dynamic_variable",
-                     "dynamic_variable": "system__caller_id", "description": "", "required": True},
-                    {"id": "note", "type": "string", "value_type": "llm_prompt",
-                     "description": "One short sentence on what they need", "required": False},
-                ],
+                "properties": {
+                    "caller_name": {"type": "string", "value_type": "llm_prompt",
+                                    "description": "The caller's name, if given"},
+                    "caller_phone": {"type": "string", "value_type": "dynamic_variable",
+                                     "dynamic_variable": "system__caller_id", "description": ""},
+                    "note": {"type": "string", "value_type": "llm_prompt",
+                             "description": "One short sentence on what they need"},
+                },
+                "required": ["caller_phone"],
             },
         },
     })
@@ -1418,14 +1419,15 @@ async def setup_agent(
                 "request_headers": tool_secret_header,
                 "request_body_schema": {
                     "type": "object",
-                    "properties": [
-                        {"id": "is_emergency", "type": "boolean", "value_type": "llm_prompt",
-                         "description": "True only for a genuine emergency or urgent situation.", "required": True},
-                        {"id": "reason", "type": "string", "value_type": "llm_prompt",
-                         "description": "One short sentence on why the caller wants to be connected.", "required": False},
-                        {"id": "caller_phone", "type": "string", "value_type": "dynamic_variable",
-                         "dynamic_variable": "system__caller_id", "description": "", "required": True},
-                    ],
+                    "properties": {
+                        "is_emergency": {"type": "boolean", "value_type": "llm_prompt",
+                                          "description": "True only for a genuine emergency or urgent situation."},
+                        "reason": {"type": "string", "value_type": "llm_prompt",
+                                   "description": "One short sentence on why the caller wants to be connected."},
+                        "caller_phone": {"type": "string", "value_type": "dynamic_variable",
+                                         "dynamic_variable": "system__caller_id", "description": ""},
+                    },
+                    "required": ["is_emergency", "caller_phone"],
                 },
             },
         })
