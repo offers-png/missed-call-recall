@@ -1355,12 +1355,14 @@ async def setup_agent(
             "request_headers": tool_secret_header,
             "request_body_schema": {
                 "type": "object",
-                "properties": {
-                    "caller_name": {"type": "string", "description": "The caller's name, if given"},
-                    "caller_phone": {"type": "string", "description": "The caller's callback phone number"},
-                    "note": {"type": "string", "description": "One short sentence on what they need"},
-                },
-                "required": ["caller_phone"],
+                "properties": [
+                    {"id": "caller_name", "type": "string", "value_type": "llm_prompt",
+                     "description": "The caller's name, if given", "required": False},
+                    {"id": "caller_phone", "type": "string", "value_type": "dynamic_variable",
+                     "dynamic_variable": "system__caller_id", "description": "", "required": True},
+                    {"id": "note", "type": "string", "value_type": "llm_prompt",
+                     "description": "One short sentence on what they need", "required": False},
+                ],
             },
         },
     })
@@ -1375,25 +1377,42 @@ async def setup_agent(
                 "request_headers": tool_secret_header,
                 "request_body_schema": {
                     "type": "object",
-                    "properties": {
-                        "is_emergency": {"type": "boolean", "description": "True only for a genuine emergency or urgent situation."},
-                        "reason": {"type": "string", "description": "One short sentence on why the caller wants to be connected."},
-                    },
-                    "required": ["is_emergency"],
+                    "properties": [
+                        {"id": "is_emergency", "type": "boolean", "value_type": "llm_prompt",
+                         "description": "True only for a genuine emergency or urgent situation.", "required": True},
+                        {"id": "reason", "type": "string", "value_type": "llm_prompt",
+                         "description": "One short sentence on why the caller wants to be connected.", "required": False},
+                        {"id": "caller_phone", "type": "string", "value_type": "dynamic_variable",
+                         "dynamic_variable": "system__caller_id", "description": "", "required": True},
+                    ],
                 },
             },
         })
     if webhook_tools:
         conversation_config["agent"]["prompt"]["tools"] = webhook_tools
 
-    # NOTE: transfer_to_number is intentionally NOT set here. ElevenLabs'
-    # agent PATCH endpoint accepts a built_in_tools field without error but
-    # doesn't actually apply it — confirmed by testing: sending it here wipes
-    # out a transfer tool that was correctly configured manually in the
-    # ElevenLabs UI, without the API version ever showing as active either.
-    # So: configure "Transfer to number" once, by hand, in the ElevenLabs UI
-    # (Tools tab → System tools → Transfer to number), and never send it from
-    # here — every previous attempt to manage this via API silently broke it.
+    # ElevenLabs' agent PATCH replaces the entire `prompt` object rather than
+    # merging into it — any field we don't include (like built_in_tools) gets
+    # silently cleared, even though we never touched it. This is what kept
+    # wiping "Transfer to number" every time this endpoint saved: we simply
+    # never sent that field, and PATCH treated that as "delete it." Fix:
+    # fetch whatever's currently live and carry it forward untouched.
+    existing_agent_id = location.get("elevenlabs_agent_id")
+    if existing_agent_id:
+        try:
+            current = requests.get(
+                f"{ELEVENLABS_BASE}/convai/agents/{existing_agent_id}",
+                headers=el_headers(),
+                timeout=20,
+            )
+            if current.ok:
+                existing_built_in_tools = (
+                    current.json().get("conversation_config", {}).get("agent", {}).get("prompt", {}).get("built_in_tools")
+                )
+                if existing_built_in_tools:
+                    conversation_config["agent"]["prompt"]["built_in_tools"] = existing_built_in_tools
+        except Exception as e:
+            log.error(f"Couldn't fetch existing agent config for {existing_agent_id}, built_in_tools may reset: {e}")
 
     def save_agent(existing_agent_id):
         if existing_agent_id:
@@ -1804,12 +1823,16 @@ async def tool_notify_owner(location_id: str, request: Request):
     """Called by the AI right before it transfers a call, so the owner gets a
     text heads-up even if they don't pick up the actual transferred call —
     a live warm-transfer message only reaches them if they answer; this
-    doesn't depend on that."""
+    doesn't depend on that. Also logs the call as a recall_messages row so
+    it's visible on the dashboard, with the real caller number (sent via the
+    system__caller_id dynamic variable, not something the LLM has to hear
+    and transcribe)."""
     check_tool_secret({k.lower(): v for k, v in request.headers.items()})
     body = await request.json()
     p = body if "is_emergency" in body or "reason" in body else body.get("parameters", {})
     is_emergency = bool(p.get("is_emergency"))
     reason = (p.get("reason") or "").strip()
+    caller_phone = (p.get("caller_phone") or "").strip() or None
 
     loc = sb.table(TABLE_LOC).select("*, recall_customers(business_name)").eq("id", location_id).execute()
     if not loc.data:
@@ -1818,6 +1841,16 @@ async def tool_notify_owner(location_id: str, request: Request):
     customer = row.pop("recall_customers", None) or {}
     location = {**customer, **row}
     target = location.get("transfer_phone") or location.get("business_phone")
+
+    try:
+        sb.table("recall_messages").insert({
+            "customer_id": location["customer_id"],
+            "caller_phone": caller_phone or "unknown",
+            "note": (reason or "Caller requested to be connected.") + (" (EMERGENCY)" if is_emergency else ""),
+        }).execute()
+    except Exception as e:
+        log.error(f"notify-owner recall_messages insert failed for location {location_id}: {e}")
+
     if not target:
         return {"result": "No transfer contact number is configured — proceed with the transfer anyway."}
 
@@ -1826,6 +1859,8 @@ async def tool_notify_owner(location_id: str, request: Request):
         message = f"🚨 URGENT call for {business_name} being connected to you now"
     else:
         message = f"Heads up: a caller is being connected to you now for {business_name}"
+    if caller_phone:
+        message += f" ({caller_phone})"
     if reason:
         message += f" — {reason}."
     else:
