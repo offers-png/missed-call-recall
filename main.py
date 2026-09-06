@@ -808,14 +808,20 @@ def resolve_message(message_id: str, customer_id: str = Form(...), authorization
     return {"ok": True}
 
 
-@app.post("/appointments/{appointment_id}/cancel")
-def cancel_appointment(appointment_id: str, customer_id: str = Form(...), authorization: str = Header(None)):
-    """Marks an appointment canceled and texts the customer directly to let
-    them know — this is a message to the CUSTOMER, not the owner, so it
-    works the same regardless of whether the business's real line is a
-    landline or a cell (the text always sends from the AI number, which
-    is the only number that can actually send SMS)."""
-    require_auth(customer_id, authorization)
+@app.post("/appointments/{appointment_id}/update")
+async def update_appointment(appointment_id: str, request: Request):
+    """One endpoint for every way an owner might need to notify a customer
+    about their appointment — cancel, reschedule (delayed or moved up), or
+    a free-typed message — always sent from the AI number since that's the
+    only number that can actually text, regardless of whether the real
+    business line is a landline or a cell."""
+    form = await request.form()
+    customer_id = form.get("customer_id")
+    action = form.get("action")  # "cancel" | "reschedule" | "custom"
+    new_start = form.get("new_start")  # ISO datetime, for reschedule
+    custom_message = form.get("custom_message")  # for custom
+    require_auth(customer_id, request.headers.get("authorization"))
+
     appt = sb.table("recall_appointments").select("*").eq("id", appointment_id).execute()
     if not appt.data or appt.data[0]["customer_id"] != customer_id:
         raise HTTPException(404, "Not found")
@@ -827,26 +833,44 @@ def cancel_appointment(appointment_id: str, customer_id: str = Form(...), author
     twilio_number = loc.data[0]["twilio_number"]
     business_name = loc.data[0].get("business_name") or sb.table(TABLE_CUST).select("business_name").eq("id", customer_id).execute().data[0]["business_name"]
 
-    sb.table("recall_appointments").update({"canceled": True}).eq("id", appointment_id).execute()
+    def local_when(iso_str: str) -> str:
+        from zoneinfo import ZoneInfo
+        dt = datetime.fromisoformat(iso_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(ZoneInfo(BUSINESS_TZ)).strftime("%A, %B %-d at %-I:%M %p")
+
+    caller_first = (row.get("caller_name") or "").split(" ")[0]
+    greeting = f"Hi {caller_first}, " if caller_first else "Hi, "
+
+    if action == "cancel":
+        sb.table("recall_appointments").update({"canceled": True}).eq("id", appointment_id).execute()
+        message = (
+            f"{greeting}your appointment with {business_name} on {local_when(row['appointment_start'])} "
+            "has been canceled. Please call us if you'd like to reschedule."
+        )
+    elif action == "reschedule":
+        if not new_start:
+            raise HTTPException(400, "Missing new_start for a reschedule.")
+        sb.table("recall_appointments").update({"appointment_start": new_start}).eq("id", appointment_id).execute()
+        message = (
+            f"{greeting}your appointment with {business_name} has been moved to "
+            f"{local_when(new_start)}. Call us if that doesn't work for you."
+        )
+    elif action == "custom":
+        if not custom_message:
+            raise HTTPException(400, "Missing custom_message.")
+        message = custom_message
+    else:
+        raise HTTPException(400, "action must be 'cancel', 'reschedule', or 'custom'.")
 
     sent = False
     if row.get("caller_phone"):
-        from zoneinfo import ZoneInfo
-        dt = row["appointment_start"]
-        dt = dt if isinstance(dt, datetime) else datetime.fromisoformat(dt)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        local_dt = dt.astimezone(ZoneInfo(BUSINESS_TZ))
-        when_str = local_dt.strftime("%A, %B %-d at %-I:%M %p")
-        message = (
-            f"Hi {row.get('caller_name') or ''}, your appointment with {business_name} "
-            f"on {when_str} has been canceled. Please call us if you'd like to reschedule."
-        ).replace("  ", " ")
         try:
             twilio_client.messages.create(to=row["caller_phone"], from_=twilio_number, body=message)
             sent = True
         except Exception as e:
-            log.error(f"Cancel-notification SMS failed for appointment {appointment_id}: {e}")
+            log.error(f"Appointment-update SMS failed for appointment {appointment_id}: {e}")
 
     return {"ok": True, "customer_notified": sent}
 
@@ -1843,6 +1867,7 @@ def _create_calendar_booking(location: dict, location_id: str, date_str: str, ti
     try:
         sb.table("recall_appointments").insert({
             "location_id": location_id,
+            "customer_id": location["customer_id"],
             "caller_name": caller_name,
             "caller_phone": caller_phone,
             "appointment_start": start.isoformat(),
