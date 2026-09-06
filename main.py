@@ -941,22 +941,25 @@ async def twilio_sms(request: Request):
         for t in turns
     ]
 
-    def call_booking_tool(name: str, tool_input: dict) -> str:
-        payload = dict(tool_input)
-        if name in ("book_appointment", "check_availability"):
-            payload["caller_phone"] = from_number
-        try:
-            endpoint = "check-availability" if name == "check_availability" else "book-appointment"
-            resp = requests.post(
-                f"{PUBLIC_BASE_URL}/tools/{endpoint}/{location['location_id']}",
-                headers={"X-Tool-Secret": ELEVENLABS_TOOL_SECRET, "Content-Type": "application/json"},
-                json=payload,
-                timeout=20,
+    async def call_booking_tool(name: str, tool_input: dict) -> str:
+        # Calls the booking logic directly in-process instead of over the
+        # network to our own server — a self-HTTP-call here previously hit
+        # real timeouts (worse on Render's free tier, which spins down when
+        # idle), where the call gave up on a slow response that then
+        # succeeded moments later anyway — updating the calendar for real
+        # while telling the caller it had failed. Calling the function
+        # directly removes that whole failure mode.
+        caller_phone = from_number if name in ("book_appointment", "check_availability") else None
+        if name == "check_availability":
+            return await _check_availability_core(
+                location["location_id"], tool_input.get("date"), tool_input.get("time"),
+                tool_input.get("caller_name"), caller_phone,
             )
-            return resp.json().get("result", "Something went wrong checking that — try again.")
-        except Exception as e:
-            log.error(f"SMS booking tool '{name}' failed for location {location['location_id']}: {e}")
-            return "Something went wrong checking that — try again shortly."
+        else:
+            return await _book_appointment_core(
+                location["location_id"], tool_input.get("date"), tool_input.get("time"),
+                tool_input.get("caller_name"), caller_phone,
+            )
 
     try:
         reply_text = ""
@@ -989,7 +992,7 @@ async def twilio_sms(request: Request):
             tool_results = []
             for block in content:
                 if block["type"] == "tool_use":
-                    result_text = call_booking_tool(block["name"], block["input"])
+                    result_text = await call_booking_tool(block["name"], block["input"])
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": block["id"],
@@ -1797,18 +1800,12 @@ def _create_calendar_booking(location: dict, location_id: str, date_str: str, ti
     return f"Booked for {caller_name} on {date_str} at {time_str}. Confirmed."
 
 
-@app.post("/tools/check-availability/{location_id}")
-async def tool_check_availability(location_id: str, request: Request):
-    check_tool_secret({k.lower(): v for k, v in request.headers.items()})
-    body = await request.json()
-    log.info(f"check-availability request body: {body}")
-    p = body if "date" in body else body.get("parameters", {})
-    date_str = p.get("date")
-    time_str = p.get("time")  # optional, "HH:MM"
-    caller_name = p.get("caller_name")
-    caller_phone = p.get("caller_phone")
+async def _check_availability_core(location_id: str, date_str: str, time_str: str, caller_name: str, caller_phone: str) -> str:
+    """The actual availability-check logic, with no dependency on an HTTP
+    Request object — callable directly in-process (no network round-trip,
+    no timeout risk) as well as from the /tools/check-availability endpoint."""
     if not date_str:
-        return {"result": "I need a specific date (YYYY-MM-DD) to check availability."}
+        return "I need a specific date (YYYY-MM-DD) to check availability."
 
     try:
         location = get_calendar_location(location_id)
@@ -1833,7 +1830,7 @@ async def tool_check_availability(location_id: str, request: Request):
         )
         if not resp.ok:
             log.error(f"Google freeBusy failed for location {location_id}: {resp.status_code} {resp.text[:400]}")
-            return {"result": "I couldn't check the calendar right now — please offer to take a message instead."}
+            return "I couldn't check the calendar right now — please offer to take a message instead."
 
         busy = resp.json().get("calendars", {}).get("primary", {}).get("busy", [])
         busy_ranges = [(datetime.fromisoformat(b["start"]), datetime.fromisoformat(b["end"])) for b in busy]
@@ -1855,7 +1852,7 @@ async def tool_check_availability(location_id: str, request: Request):
             try:
                 requested = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=tz)
             except ValueError:
-                return {"result": "That time didn't look right — please use 24-hour HH:MM format."}
+                return "That time didn't look right — please use 24-hour HH:MM format."
             if requested in all_slots and is_free(requested):
                 if caller_name and caller_phone:
                     # Already have everything needed — book it directly instead
@@ -1879,12 +1876,39 @@ async def tool_check_availability(location_id: str, request: Request):
             else:
                 result = f"Available times on {date_str}: " + ", ".join(free_slots)
         log.info(f"check-availability result: {result}")
-        return {"result": result}
+        return result
     except ValueError:
-        return {"result": "That date didn't look right — please use YYYY-MM-DD format."}
+        return "That date didn't look right — please use YYYY-MM-DD format."
     except Exception:
         log.exception(f"check-availability crashed for location {location_id}")
-        return {"result": "I couldn't check the calendar right now — please offer to take a message instead."}
+        return "I couldn't check the calendar right now — please offer to take a message instead."
+
+
+@app.post("/tools/check-availability/{location_id}")
+async def tool_check_availability(location_id: str, request: Request):
+    check_tool_secret({k.lower(): v for k, v in request.headers.items()})
+    body = await request.json()
+    log.info(f"check-availability request body: {body}")
+    p = body if "date" in body else body.get("parameters", {})
+    result = await _check_availability_core(
+        location_id, p.get("date"), p.get("time"), p.get("caller_name"), p.get("caller_phone")
+    )
+    return {"result": result}
+
+
+async def _book_appointment_core(location_id: str, date_str: str, time_str: str, caller_name: str, caller_phone: str) -> str:
+    """Same idea as _check_availability_core — no Request dependency, so
+    the SMS handler can call this directly in-process."""
+    if not all([date_str, time_str, caller_name, caller_phone]):
+        return "I'm missing some details — I need the date, time, the caller's name, and their phone number."
+    try:
+        location = get_calendar_location(location_id)
+        return _create_calendar_booking(location, location_id, date_str, time_str, caller_name, caller_phone)
+    except ValueError:
+        return "That date or time didn't look right — date as YYYY-MM-DD, time as HH:MM."
+    except Exception:
+        log.exception(f"book-appointment crashed for location {location_id}")
+        return "I couldn't book that — please offer to take a message instead."
 
 
 @app.post("/tools/book-appointment/{location_id}")
@@ -1893,20 +1917,10 @@ async def tool_book_appointment(location_id: str, request: Request):
     body = await request.json()
     log.info(f"book-appointment request body: {body}")
     p = body if "date" in body else body.get("parameters", {})
-    date_str, time_str = p.get("date"), p.get("time")
-    caller_name, caller_phone = p.get("caller_name"), p.get("caller_phone")
-    if not all([date_str, time_str, caller_name, caller_phone]):
-        return {"result": "I'm missing some details — I need the date, time, the caller's name, and their phone number."}
-
-    try:
-        location = get_calendar_location(location_id)
-        result = _create_calendar_booking(location, location_id, date_str, time_str, caller_name, caller_phone)
-        return {"result": result}
-    except ValueError:
-        return {"result": "That date or time didn't look right — date as YYYY-MM-DD, time as HH:MM."}
-    except Exception:
-        log.exception(f"book-appointment crashed for location {location_id}")
-        return {"result": "I couldn't book that — please offer to take a message instead."}
+    result = await _book_appointment_core(
+        location_id, p.get("date"), p.get("time"), p.get("caller_name"), p.get("caller_phone")
+    )
+    return {"result": result}
 
 
 @app.post("/tools/notify-owner/{location_id}")
