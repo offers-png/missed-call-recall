@@ -771,6 +771,17 @@ def dashboard(customer_id: str, location_id: str = None, authorization: str = He
         .execute()
     )
 
+    appointments = (
+        sb.table("recall_appointments")
+        .select("*")
+        .eq("location_id", loc["id"])
+        .eq("canceled", False)
+        .gt("appointment_start", datetime.now(timezone.utc).isoformat())
+        .order("appointment_start")
+        .limit(50)
+        .execute()
+    )
+
     return {
         "business_name": customer["business_name"],
         "status": customer["status"],
@@ -783,6 +794,7 @@ def dashboard(customer_id: str, location_id: str = None, authorization: str = He
         "stats": {"missed_calls_recent": total, "auto_texts_sent": texted},
         "recent_calls": calls.data,
         "messages": messages.data,
+        "appointments": appointments.data,
     }
 
 
@@ -794,6 +806,49 @@ def resolve_message(message_id: str, customer_id: str = Form(...), authorization
         raise HTTPException(404, "Not found")
     sb.table("recall_messages").update({"resolved": True}).eq("id", message_id).execute()
     return {"ok": True}
+
+
+@app.post("/appointments/{appointment_id}/cancel")
+def cancel_appointment(appointment_id: str, customer_id: str = Form(...), authorization: str = Header(None)):
+    """Marks an appointment canceled and texts the customer directly to let
+    them know — this is a message to the CUSTOMER, not the owner, so it
+    works the same regardless of whether the business's real line is a
+    landline or a cell (the text always sends from the AI number, which
+    is the only number that can actually send SMS)."""
+    require_auth(customer_id, authorization)
+    appt = sb.table("recall_appointments").select("*").eq("id", appointment_id).execute()
+    if not appt.data or appt.data[0]["customer_id"] != customer_id:
+        raise HTTPException(404, "Not found")
+    row = appt.data[0]
+
+    loc = sb.table(TABLE_LOC).select("twilio_number, business_name").eq("id", row["location_id"]).execute()
+    if not loc.data:
+        raise HTTPException(404, "Location not found for this appointment.")
+    twilio_number = loc.data[0]["twilio_number"]
+    business_name = loc.data[0].get("business_name") or sb.table(TABLE_CUST).select("business_name").eq("id", customer_id).execute().data[0]["business_name"]
+
+    sb.table("recall_appointments").update({"canceled": True}).eq("id", appointment_id).execute()
+
+    sent = False
+    if row.get("caller_phone"):
+        from zoneinfo import ZoneInfo
+        dt = row["appointment_start"]
+        dt = dt if isinstance(dt, datetime) else datetime.fromisoformat(dt)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        local_dt = dt.astimezone(ZoneInfo(BUSINESS_TZ))
+        when_str = local_dt.strftime("%A, %B %-d at %-I:%M %p")
+        message = (
+            f"Hi {row.get('caller_name') or ''}, your appointment with {business_name} "
+            f"on {when_str} has been canceled. Please call us if you'd like to reschedule."
+        ).replace("  ", " ")
+        try:
+            twilio_client.messages.create(to=row["caller_phone"], from_=twilio_number, body=message)
+            sent = True
+        except Exception as e:
+            log.error(f"Cancel-notification SMS failed for appointment {appointment_id}: {e}")
+
+    return {"ok": True, "customer_notified": sent}
 
 
 # ---------------------------------------------------------------------------
