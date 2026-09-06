@@ -827,42 +827,48 @@ async def update_appointment(appointment_id: str, request: Request):
         raise HTTPException(404, "Not found")
     row = appt.data[0]
 
-    loc = sb.table(TABLE_LOC).select("twilio_number, business_name").eq("id", row["location_id"]).execute()
-    if not loc.data:
-        raise HTTPException(404, "Location not found for this appointment.")
-    twilio_number = loc.data[0]["twilio_number"]
-    business_name = loc.data[0].get("business_name") or sb.table(TABLE_CUST).select("business_name").eq("id", customer_id).execute().data[0]["business_name"]
+    try:
+        loc = sb.table(TABLE_LOC).select("twilio_number, recall_customers(business_name)").eq("id", row["location_id"]).execute()
+        if not loc.data:
+            raise HTTPException(404, "Location not found for this appointment.")
+        twilio_number = loc.data[0]["twilio_number"]
+        business_name = (loc.data[0].get("recall_customers") or {}).get("business_name") or "the business"
 
-    def local_when(iso_str: str) -> str:
-        from zoneinfo import ZoneInfo
-        dt = datetime.fromisoformat(iso_str)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(ZoneInfo(BUSINESS_TZ)).strftime("%A, %B %-d at %-I:%M %p")
+        def local_when(iso_str: str) -> str:
+            from zoneinfo import ZoneInfo
+            dt = datetime.fromisoformat(iso_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(ZoneInfo(BUSINESS_TZ)).strftime("%A, %B %-d at %-I:%M %p")
 
-    caller_first = (row.get("caller_name") or "").split(" ")[0]
-    greeting = f"Hi {caller_first}, " if caller_first else "Hi, "
+        caller_first = (row.get("caller_name") or "").split(" ")[0]
+        greeting = f"Hi {caller_first}, " if caller_first else "Hi, "
 
-    if action == "cancel":
-        sb.table("recall_appointments").update({"canceled": True}).eq("id", appointment_id).execute()
-        message = (
-            f"{greeting}your appointment with {business_name} on {local_when(row['appointment_start'])} "
-            "has been canceled. Please call us if you'd like to reschedule."
-        )
-    elif action == "reschedule":
-        if not new_start:
-            raise HTTPException(400, "Missing new_start for a reschedule.")
-        sb.table("recall_appointments").update({"appointment_start": new_start}).eq("id", appointment_id).execute()
-        message = (
-            f"{greeting}your appointment with {business_name} has been moved to "
-            f"{local_when(new_start)}. Call us if that doesn't work for you."
-        )
-    elif action == "custom":
-        if not custom_message:
-            raise HTTPException(400, "Missing custom_message.")
-        message = custom_message
-    else:
-        raise HTTPException(400, "action must be 'cancel', 'reschedule', or 'custom'.")
+        if action == "cancel":
+            sb.table("recall_appointments").update({"canceled": True}).eq("id", appointment_id).execute()
+            message = (
+                f"{greeting}your appointment with {business_name} on {local_when(row['appointment_start'])} "
+                "has been canceled. Please call us if you'd like to reschedule."
+            )
+        elif action == "reschedule":
+            if not new_start:
+                raise HTTPException(400, "Missing new_start for a reschedule.")
+            sb.table("recall_appointments").update({"appointment_start": new_start}).eq("id", appointment_id).execute()
+            message = (
+                f"{greeting}your appointment with {business_name} has been moved to "
+                f"{local_when(new_start)}. Call us if that doesn't work for you."
+            )
+        elif action == "custom":
+            if not custom_message:
+                raise HTTPException(400, "Missing custom_message.")
+            message = custom_message
+        else:
+            raise HTTPException(400, "action must be 'cancel', 'reschedule', or 'custom'.")
+    except HTTPException:
+        raise
+    except Exception:
+        log.exception(f"appointment update crashed for {appointment_id}")
+        raise HTTPException(500, "Something went wrong updating that appointment — please try again.")
 
     sent = False
     if row.get("caller_phone"):
