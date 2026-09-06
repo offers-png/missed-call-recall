@@ -903,12 +903,14 @@ async def twilio_sms(request: Request):
         tools = [
             {
                 "name": "check_availability",
-                "description": "Check open appointment slots on a given date, optionally near a specific time.",
+                "description": "Check open appointment slots on a given date, optionally near a specific time. If the caller already gave their name and phone number and the exact time they asked about is free, this books it immediately — you don't need to call book_appointment separately in that case. Only call book_appointment afterward if this returns availability without booking (e.g. they didn't give their name/phone yet).",
                 "input_schema": {
                     "type": "object",
                     "properties": {
                         "date": {"type": "string", "description": "YYYY-MM-DD"},
                         "time": {"type": "string", "description": "Optional specific time, 24-hour HH:MM"},
+                        "caller_name": {"type": "string", "description": "Optional. Include if the caller already gave their name — enables direct booking."},
+                        "caller_phone": {"type": "string", "description": "Optional. Include if the caller already gave their phone number — enables direct booking."},
                     },
                     "required": ["date"],
                 },
@@ -935,7 +937,7 @@ async def twilio_sms(request: Request):
 
     def call_booking_tool(name: str, tool_input: dict) -> str:
         payload = dict(tool_input)
-        if name == "book_appointment":
+        if name in ("book_appointment", "check_availability"):
             payload["caller_phone"] = from_number
         try:
             endpoint = "check-availability" if name == "check_availability" else "book-appointment"
@@ -1369,7 +1371,7 @@ async def setup_agent(
             {
                 "type": "webhook",
                 "name": "check_availability",
-                "description": "Check whether a specific time is open on a given date. Always pass 'time' when the caller mentions a specific time (e.g. '3pm') so it checks that exact slot — don't omit it and just browse the morning.",
+                "description": "Check whether a specific time is open on a given date. Always pass 'time' when the caller mentions a specific time (e.g. '3pm') so it checks that exact slot — don't omit it and just browse the morning. If the caller already gave their name and phone number (in this message or earlier), pass those too — this books the appointment immediately when the slot is free, so you don't need to call book_appointment separately in that case.",
                 "api_schema": {
                     "url": f"{PUBLIC_BASE_URL}/tools/check-availability/{location['id']}",
                     "method": "POST",
@@ -1377,8 +1379,10 @@ async def setup_agent(
                     "request_body_schema": {
                         "type": "object",
                         "properties": {
-                            "date": {"type": "string", "description": "Date to check, format YYYY-MM-DD"},
-                            "time": {"type": "string", "description": "Optional. 24-hour time HH:MM. Include this whenever the caller mentioned a specific time — checks that exact slot instead of just listing morning openings."},
+                            "date": {"type": "string", "value_type": "llm_prompt", "description": "Date to check, format YYYY-MM-DD"},
+                            "time": {"type": "string", "value_type": "llm_prompt", "description": "Optional. 24-hour time HH:MM. Include this whenever the caller mentioned a specific time — checks that exact slot instead of just listing morning openings."},
+                            "caller_name": {"type": "string", "value_type": "llm_prompt", "description": "Optional. The caller's name, if already given — enables direct booking when the slot is free."},
+                            "caller_phone": {"type": "string", "value_type": "dynamic_variable", "dynamic_variable": "system__caller_id", "description": ""},
                         },
                         "required": ["date"],
                     },
@@ -1738,12 +1742,66 @@ def get_calendar_location(location_id: str) -> dict:
 
 
 @app.post("/tools/check-availability/{location_id}")
+def _create_calendar_booking(location: dict, location_id: str, date_str: str, time_str: str, caller_name: str, caller_phone: str) -> str:
+    """Actually creates the calendar event + appointment record. Shared by
+    book_appointment and by check_availability's direct-booking shortcut
+    (used when the caller already gave their name/phone in the same message
+    — relying on the model to always make a second tool call afterward
+    proved unreliable in practice, so the common case is handled in one
+    call instead of two)."""
+    hours_start = location.get("booking_hours_start", DEFAULT_BUSINESS_HOURS[0])
+    hours_end = location.get("booking_hours_end", DEFAULT_BUSINESS_HOURS[1])
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(BUSINESS_TZ)
+    start = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=tz)
+    end = start + timedelta(minutes=SLOT_MINUTES)
+    day_start = start.replace(hour=hours_start, minute=0, second=0, microsecond=0)
+    day_end = day_start + timedelta(hours=(hours_end - hours_start))
+    if not (day_start <= start and end <= day_end):
+        return f"That time is outside booking hours ({hours_start}:00–{hours_end}:00) — offer a time within that window."
+
+    access_token = google_access_token(location["google_calendar_refresh_token"])
+    resp = requests.post(
+        "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+        json={
+            "summary": f"{caller_name} — {location['business_name']} appointment",
+            "description": f"Booked by Recall AI. Caller phone: {caller_phone}",
+            "start": {"dateTime": start.isoformat()},
+            "end": {"dateTime": end.isoformat()},
+        },
+        timeout=20,
+    )
+    if not resp.ok:
+        log.error(f"Google event creation failed for location {location_id}: {resp.status_code} {resp.text[:400]}")
+        return "I couldn't book that — please offer to take a message instead."
+    log.info(f"book-appointment success, event id: {resp.json().get('id')}")
+
+    try:
+        sb.table("recall_appointments").insert({
+            "location_id": location_id,
+            "caller_name": caller_name,
+            "caller_phone": caller_phone,
+            "appointment_start": start.isoformat(),
+        }).execute()
+    except Exception as e:
+        # Booking itself already succeeded on the real calendar — don't
+        # fail the whole tool call just because the reminder record failed.
+        log.error(f"Couldn't save appointment record for reminders (location {location_id}): {e}")
+
+    return f"Booked for {caller_name} on {date_str} at {time_str}. Confirmed."
+
+
+@app.post("/tools/check-availability/{location_id}")
 async def tool_check_availability(location_id: str, request: Request):
     check_tool_secret({k.lower(): v for k, v in request.headers.items()})
     body = await request.json()
     log.info(f"check-availability request body: {body}")
-    date_str = body.get("date") or body.get("parameters", {}).get("date")
-    time_str = body.get("time") or body.get("parameters", {}).get("time")  # optional, "HH:MM"
+    p = body if "date" in body else body.get("parameters", {})
+    date_str = p.get("date")
+    time_str = p.get("time")  # optional, "HH:MM"
+    caller_name = p.get("caller_name")
+    caller_phone = p.get("caller_phone")
     if not date_str:
         return {"result": "I need a specific date (YYYY-MM-DD) to check availability."}
 
@@ -1794,7 +1852,12 @@ async def tool_check_availability(location_id: str, request: Request):
             except ValueError:
                 return {"result": "That time didn't look right — please use 24-hour HH:MM format."}
             if requested in all_slots and is_free(requested):
-                result = f"Yes, {requested.strftime('%-I:%M %p')} on {date_str} is available."
+                if caller_name and caller_phone:
+                    # Already have everything needed — book it directly instead
+                    # of just confirming and hoping a second tool call follows.
+                    result = _create_calendar_booking(location, location_id, date_str, time_str, caller_name, caller_phone)
+                else:
+                    result = f"Yes, {requested.strftime('%-I:%M %p')} on {date_str} is available."
             else:
                 free = [s for s in all_slots if is_free(s)]
                 nearby = sorted(free, key=lambda s: abs((s - requested).total_seconds()))[:5]
@@ -1832,47 +1895,8 @@ async def tool_book_appointment(location_id: str, request: Request):
 
     try:
         location = get_calendar_location(location_id)
-        hours_start = location.get("booking_hours_start", DEFAULT_BUSINESS_HOURS[0])
-        hours_end = location.get("booking_hours_end", DEFAULT_BUSINESS_HOURS[1])
-        from zoneinfo import ZoneInfo
-        tz = ZoneInfo(BUSINESS_TZ)
-        start = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=tz)
-        end = start + timedelta(minutes=SLOT_MINUTES)
-        day_start = start.replace(hour=hours_start, minute=0, second=0, microsecond=0)
-        day_end = day_start + timedelta(hours=(hours_end - hours_start))  # handles hours_end=24 (midnight) safely
-        if not (day_start <= start and end <= day_end):
-            return {"result": f"That time is outside booking hours ({hours_start}:00–{hours_end}:00) — offer a time within that window."}
-
-        access_token = google_access_token(location["google_calendar_refresh_token"])
-        resp = requests.post(
-            "https://www.googleapis.com/calendar/v3/calendars/primary/events",
-            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-            json={
-                "summary": f"{caller_name} — {location['business_name']} appointment",
-                "description": f"Booked by Recall AI. Caller phone: {caller_phone}",
-                "start": {"dateTime": start.isoformat()},
-                "end": {"dateTime": end.isoformat()},
-            },
-            timeout=20,
-        )
-        if not resp.ok:
-            log.error(f"Google event creation failed for location {location_id}: {resp.status_code} {resp.text[:400]}")
-            return {"result": "I couldn't book that — please offer to take a message instead."}
-        log.info(f"book-appointment success, event id: {resp.json().get('id')}")
-
-        try:
-            sb.table("recall_appointments").insert({
-                "location_id": location_id,
-                "caller_name": caller_name,
-                "caller_phone": caller_phone,
-                "appointment_start": start.isoformat(),
-            }).execute()
-        except Exception as e:
-            # Booking itself already succeeded on the real calendar — don't
-            # fail the whole tool call just because the reminder record failed.
-            log.error(f"Couldn't save appointment record for reminders (location {location_id}): {e}")
-
-        return {"result": f"Booked for {caller_name} on {date_str} at {time_str}. Confirmed."}
+        result = _create_calendar_booking(location, location_id, date_str, time_str, caller_name, caller_phone)
+        return {"result": result}
     except ValueError:
         return {"result": "That date or time didn't look right — date as YYYY-MM-DD, time as HH:MM."}
     except Exception:
