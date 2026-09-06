@@ -1741,7 +1741,6 @@ def get_calendar_location(location_id: str) -> dict:
     return merged
 
 
-@app.post("/tools/check-availability/{location_id}")
 def _create_calendar_booking(location: dict, location_id: str, date_str: str, time_str: str, caller_name: str, caller_phone: str) -> str:
     """Actually creates the calendar event + appointment record. Shared by
     book_appointment and by check_availability's direct-booking shortcut
