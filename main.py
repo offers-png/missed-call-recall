@@ -866,8 +866,8 @@ async def twilio_sms(request: Request):
         return PlainTextResponse("", media_type="application/xml")
 
     sb.table("recall_sms_messages").insert({
-        "location_id": location["location_id"], "direction": "inbound",
-        "from_number": from_number, "body": body,
+        "location_id": location["location_id"], "customer_id": location["customer_id"],
+        "direction": "inbound", "from_number": from_number, "body": body,
     }).execute()
 
     history = (
@@ -998,8 +998,8 @@ async def twilio_sms(request: Request):
     try:
         twilio_client.messages.create(to=from_number, from_=to_number, body=reply_text)
         sb.table("recall_sms_messages").insert({
-            "location_id": location["location_id"], "direction": "outbound",
-            "from_number": to_number, "body": reply_text,
+            "location_id": location["location_id"], "customer_id": location["customer_id"],
+            "direction": "outbound", "from_number": to_number, "body": reply_text,
         }).execute()
     except Exception as e:
         log.error(f"SMS AI reply send failed for location {location['location_id']}: {e}")
