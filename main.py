@@ -896,9 +896,15 @@ async def twilio_sms(request: Request):
         system_prompt += (
             "\n\nYou can also check availability and book appointments directly in this "
             "text conversation using the tools provided. Today's date is "
-            f"{datetime.now().strftime('%Y-%m-%d')}. Get the date and time the customer "
-            "wants, confirm their name, then book it — you already have their phone number "
-            "from this text conversation, so don't ask for it."
+            f"{datetime.now().strftime('%Y-%m-%d')}. You already have their phone number "
+            "from this text conversation, so don't ask for it. If the caller gives a date, "
+            "time, and their name (in this message or earlier), call check_availability with "
+            "all of that — if the time is free, it books it immediately in that same call and "
+            "returns a confirmation. Do NOT call book_appointment afterward in that case — "
+            "check_availability already completed the booking, and calling book_appointment "
+            "again would try to double-book the same slot. Only call book_appointment "
+            "separately if check_availability returned availability without booking (for "
+            "example, because you didn't have their name yet when you checked)."
         )
         tools = [
             {
