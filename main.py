@@ -878,7 +878,56 @@ async def update_appointment(appointment_id: str, request: Request):
         except Exception as e:
             log.error(f"Appointment-update SMS failed for appointment {appointment_id}: {e}")
 
-    return {"ok": True, "customer_notified": sent}
+    called = False
+    if action == "cancel" and row.get("caller_phone"):
+        try:
+            twilio_client.calls.create(
+                to=row["caller_phone"],
+                from_=twilio_number,
+                url=f"{PUBLIC_BASE_URL}/twilio/cancellation-twiml/{appointment_id}",
+                method="POST",
+            )
+            called = True
+        except Exception as e:
+            log.error(f"Appointment-cancellation call failed for appointment {appointment_id}: {e}")
+
+    return {"ok": True, "customer_notified": sent, "customer_called": called}
+
+
+@app.post("/twilio/cancellation-twiml/{appointment_id}")
+async def cancellation_twiml(appointment_id: str):
+    """Twilio fetches this when the cancellation call connects (including to
+    voicemail — Twilio still plays <Say> content even if a machine picks up).
+    Reuses the exact same pattern as the reminder-call TwiML."""
+    vr = VoiceResponse()
+    appt = (
+        sb.table("recall_appointments")
+        .select("*, recall_locations(recall_customers(business_name))")
+        .eq("id", appointment_id)
+        .execute()
+    )
+    if not appt.data:
+        vr.say("Sorry, we couldn't find your appointment details.")
+        return PlainTextResponse(str(vr), media_type="application/xml")
+
+    row = appt.data[0]
+    loc = row.get("recall_locations") or {}
+    customer = loc.get("recall_customers") or {}
+    business_name = customer.get("business_name", "the business")
+
+    from zoneinfo import ZoneInfo
+    dt = row["appointment_start"]
+    dt = dt if isinstance(dt, datetime) else datetime.fromisoformat(dt)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    when_str = dt.astimezone(ZoneInfo(BUSINESS_TZ)).strftime("%A, %B %-d at %-I:%M %p")
+
+    vr.say(
+        f"Hi, this is {business_name}. We're calling to let you know your appointment "
+        f"on {when_str} has been canceled. Please call us back if you'd like to "
+        f"reschedule. Sorry for the inconvenience. Goodbye."
+    )
+    return PlainTextResponse(str(vr), media_type="application/xml")
 
 
 # ---------------------------------------------------------------------------
