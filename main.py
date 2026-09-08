@@ -1702,6 +1702,234 @@ async def setup_agent(
 
 
 # ---------------------------------------------------------------------------
+# BULK ADMIN TOOL — re-save every existing Elite agent's ElevenLabs config.
+#
+# Why this exists: changes to an individual agent's ElevenLabs config (like
+# the LLM model after a deprecation, or a system-prompt wording tweak) are
+# per-agent, not global — a fix to ELEVENLABS_LLM_MODEL in Render only takes
+# effect for a given customer once their agent is re-saved. Before this,
+# that meant manually opening every Elite customer's dashboard and clicking
+# "Save AI agent settings" one at a time. This re-saves all of them in one
+# call, using each location's *already stored* voice/fallback/PDF — nothing
+# about the customer's own settings changes, only the agent config Twilio/
+# ElevenLabs actually runs gets refreshed against current env vars.
+#
+# Only re-PATCHes agents that already exist (elevenlabs_agent_id is set).
+# Never creates a new agent and never imports/re-imports a phone number —
+# both of those are one-time, first-setup actions and stay in setup_agent.
+# ---------------------------------------------------------------------------
+def _resave_agent_for_location(customer: dict, location: dict) -> dict:
+    """Rebuilds and re-PATCHes one location's ElevenLabs agent from its
+    already-saved settings. Returns a small result dict; never raises —
+    callers collect per-location results so one failure doesn't stop the
+    batch."""
+    agent_id = location.get("elevenlabs_agent_id")
+    if not agent_id:
+        return {"location_id": location["id"], "status": "skipped", "detail": "No agent set up yet."}
+
+    voice_id = location.get("elevenlabs_voice_id")
+    fallback_behavior = location.get("fallback_behavior") or "message"
+    kb_doc_id = location.get("elevenlabs_kb_doc_id")
+    transfer_target = location.get("transfer_phone") or location.get("business_phone")
+
+    fallback_instructions = {
+        "message": "If you don't know the answer, politely ask for their name and phone number, then call take_message with those details so someone actually gets notified — don't just say you'll pass it along without calling the tool.",
+        "transfer": "If you don't know the answer, offer to connect them to a person using your transfer ability.",
+        "try_harder": "Check the knowledge base carefully before giving up — rephrase the question in your head and look again. Only if you're truly certain the answer isn't in the knowledge base, ask for their name and number, then call take_message with those details.",
+    }
+    system_prompt = (
+        f"You are the phone receptionist for {customer['business_name']}. "
+        "Be friendly, concise, and helpful. Answer questions using the knowledge base provided. "
+        + fallback_instructions.get(fallback_behavior, fallback_instructions["message"])
+    )
+    if transfer_target:
+        system_prompt += (
+            " If the caller explicitly asks to speak to a person, a manager, or customer service, "
+            "or describes any kind of emergency or urgent situation, do exactly this, in order: "
+            "(1) call notify_owner (set is_emergency to true only for genuine emergencies, with a "
+            "one-sentence reason), (2) IMMEDIATELY call your transfer tool in that same turn to "
+            "actually connect the call. Calling notify_owner is not the transfer — it only sends a "
+            "text. You must still call the separate transfer tool right after. Never say phrases like "
+            "'connecting you now', 'please hold', 'one moment', or 'you should be connected shortly' "
+            "unless you have already called the transfer tool — if you catch yourself about to say "
+            "any of those without having called it, call it first. Do not narrate a transfer that "
+            "hasn't actually happened."
+        )
+    calendar_connected = customer.get("tier") == "elite" and location.get("google_calendar_connected")
+    if calendar_connected:
+        from zoneinfo import ZoneInfo
+        today_str = datetime.now(ZoneInfo(BUSINESS_TZ)).strftime("%A, %B %d, %Y")
+        system_prompt += (
+            f" Today's actual date is {today_str}. Always use this as the reference point when the "
+            "caller says things like 'tomorrow', 'next Monday', or 'this Friday' — calculate the real "
+            "calendar date from it rather than guessing."
+        )
+        system_prompt += (
+            " You can also book appointments. If the caller mentions a specific time (like '3pm'), "
+            "always pass that exact time to check_availability so it checks that slot directly — "
+            "never just call check_availability with only the date, since that only returns a few "
+            "early options and can wrongly suggest a free time is taken. If the caller hasn't given a "
+            "time yet, call check_availability with just the date to see general openings. "
+            "IMPORTANT: checking availability is never the end of the task if the caller actually "
+            "wants to book (not just asking what's open) — if the slot is available AND you already "
+            "have their name and callback phone number (they may have given these upfront in the same "
+            "message), immediately call book_appointment in that same turn. Do not stop after telling "
+            "them a time is available and wait for them to ask again — that is treating confirmation "
+            "as if it were the booking, and it isn't. Only ask them for name/phone if they genuinely "
+            "haven't given it yet. Only tell the caller an appointment is confirmed if the "
+            "book_appointment tool actually returns success — never say it's booked if the tool failed "
+            "or you didn't call it; if that happens, apologize and offer to take a message instead. "
+            "If a time isn't available, never guess or invent a reason why (like 'it's booked by "
+            "another customer') unless the tool's response actually told you that reason — if you don't "
+            "know why, just say it's not available and offer the alternative times the tool gave you."
+        )
+
+    conversation_config = {
+        "agent": {
+            "first_message": f"Hi, thanks for calling {customer['business_name']}! How can I help you today?",
+            "language": "en",
+            "prompt": {"prompt": system_prompt, "llm": ELEVENLABS_LLM_MODEL, "temperature": 0.5},
+        },
+        "tts": {"voice_id": voice_id},
+    }
+    if kb_doc_id:
+        conversation_config["agent"]["prompt"]["knowledge_base"] = [
+            {"id": kb_doc_id, "type": "file", "name": f"{customer['business_name']} info"}
+        ]
+
+    tool_secret_header = {"X-Tool-Secret": ELEVENLABS_TOOL_SECRET}
+    webhook_tools = []
+    if calendar_connected:
+        webhook_tools.extend([
+            {
+                "type": "webhook", "name": "check_availability",
+                "description": "Check whether a specific time is open on a given date. Always pass 'time' when the caller mentions a specific time (e.g. '3pm') so it checks that exact slot — don't omit it and just browse the morning. If the caller already gave their name and phone number (in this message or earlier), pass those too — this books the appointment immediately when the slot is free, so you don't need to call book_appointment separately in that case.",
+                "api_schema": {
+                    "url": f"{PUBLIC_BASE_URL}/tools/check-availability/{location['id']}",
+                    "method": "POST", "request_headers": tool_secret_header,
+                    "request_body_schema": {
+                        "type": "object",
+                        "properties": {
+                            "date": {"type": "string", "value_type": "llm_prompt", "description": "Date to check, format YYYY-MM-DD"},
+                            "time": {"type": "string", "value_type": "llm_prompt", "description": "Optional. 24-hour time HH:MM. Include this whenever the caller mentioned a specific time — checks that exact slot instead of just listing morning openings."},
+                            "caller_name": {"type": "string", "value_type": "llm_prompt", "description": "Optional. The caller's name, if already given — enables direct booking when the slot is free."},
+                            "caller_phone": {"type": "string", "value_type": "dynamic_variable", "dynamic_variable": "system__caller_id", "description": ""},
+                        },
+                        "required": ["date"],
+                    },
+                },
+            },
+            {
+                "type": "webhook", "name": "book_appointment",
+                "description": "Book an appointment on the business's calendar once the caller confirms a date and time.",
+                "api_schema": {
+                    "url": f"{PUBLIC_BASE_URL}/tools/book-appointment/{location['id']}",
+                    "method": "POST", "request_headers": tool_secret_header,
+                    "request_body_schema": {
+                        "type": "object",
+                        "properties": {
+                            "date": {"type": "string", "description": "Date, format YYYY-MM-DD"},
+                            "time": {"type": "string", "description": "24-hour time, format HH:MM"},
+                            "caller_name": {"type": "string", "description": "The caller's name"},
+                            "caller_phone": {"type": "string", "description": "The caller's callback phone number"},
+                        },
+                        "required": ["date", "time", "caller_name", "caller_phone"],
+                    },
+                },
+            },
+        ])
+    webhook_tools.append({
+        "type": "webhook", "name": "take_message",
+        "description": "Log a callback request when you can't help the caller directly — always call this rather than just telling the caller you'll pass their info along.",
+        "api_schema": {
+            "url": f"{PUBLIC_BASE_URL}/tools/take-message/{location['id']}",
+            "method": "POST", "request_headers": tool_secret_header,
+            "request_body_schema": {
+                "type": "object",
+                "properties": {
+                    "caller_name": {"type": "string", "value_type": "llm_prompt", "description": "The caller's name, if given"},
+                    "caller_phone": {"type": "string", "value_type": "dynamic_variable", "dynamic_variable": "system__caller_id", "description": ""},
+                    "note": {"type": "string", "value_type": "llm_prompt", "description": "One short sentence on what they need"},
+                },
+                "required": ["caller_phone"],
+            },
+        },
+    })
+    if transfer_target:
+        webhook_tools.append({
+            "type": "webhook", "name": "notify_owner",
+            "description": "Send a text heads-up to the business before transferring a call to them — call this right before connecting the caller, always.",
+            "api_schema": {
+                "url": f"{PUBLIC_BASE_URL}/tools/notify-owner/{location['id']}",
+                "method": "POST", "request_headers": tool_secret_header,
+                "request_body_schema": {
+                    "type": "object",
+                    "properties": {
+                        "is_emergency": {"type": "boolean", "value_type": "llm_prompt", "description": "True only for a genuine emergency or urgent situation."},
+                        "reason": {"type": "string", "value_type": "llm_prompt", "description": "One short sentence on why the caller wants to be connected."},
+                        "caller_phone": {"type": "string", "value_type": "dynamic_variable", "dynamic_variable": "system__caller_id", "description": ""},
+                    },
+                    "required": ["is_emergency", "caller_phone"],
+                },
+            },
+        })
+    if webhook_tools:
+        conversation_config["agent"]["prompt"]["tools"] = webhook_tools
+
+    # Same built_in_tools preservation as setup_agent — PATCH replaces the
+    # whole prompt object, so anything we don't carry forward gets wiped.
+    try:
+        current = requests.get(f"{ELEVENLABS_BASE}/convai/agents/{agent_id}", headers=el_headers(), timeout=20)
+        if current.ok:
+            existing_built_in_tools = (
+                current.json().get("conversation_config", {}).get("agent", {}).get("prompt", {}).get("built_in_tools")
+            )
+            if existing_built_in_tools:
+                conversation_config["agent"]["prompt"]["built_in_tools"] = existing_built_in_tools
+    except Exception as e:
+        log.error(f"Bulk resave: couldn't fetch existing built_in_tools for agent {agent_id}: {e}")
+
+    try:
+        resp = requests.patch(
+            f"{ELEVENLABS_BASE}/convai/agents/{agent_id}",
+            headers={**el_headers(), "Content-Type": "application/json"},
+            json={"conversation_config": conversation_config},
+            timeout=30,
+        )
+        if not resp.ok:
+            return {"location_id": location["id"], "agent_id": agent_id, "status": "failed", "detail": resp.text[:300]}
+        return {"location_id": location["id"], "agent_id": agent_id, "status": "resaved"}
+    except Exception as e:
+        return {"location_id": location["id"], "agent_id": agent_id, "status": "failed", "detail": str(e)}
+
+
+@app.post("/admin/resave-elite-agents")
+def resave_elite_agents(authorization: str = Header(None)):
+    """Saleh-only. Loops every Elite customer's location that already has an
+    ElevenLabs agent and re-saves it against current env vars (e.g. a new
+    ELEVENLABS_LLM_MODEL after a deprecation). Use after changing a shared
+    env var, not after an individual customer's own settings change — those
+    still save normally through their own dashboard."""
+    require_admin(authorization)
+    require_elevenlabs()
+
+    customers = sb.table(TABLE_CUST).select("*").eq("tier", "elite").execute().data
+    results = []
+    for customer in customers:
+        locations = sb.table(TABLE_LOC).select("*").eq("customer_id", customer["id"]).execute().data
+        for location in locations:
+            result = _resave_agent_for_location(customer, location)
+            result["business_name"] = customer.get("business_name")
+            result["location_label"] = location.get("location_label")
+            results.append(result)
+
+    resaved = sum(1 for r in results if r["status"] == "resaved")
+    failed = sum(1 for r in results if r["status"] == "failed")
+    skipped = sum(1 for r in results if r["status"] == "skipped")
+    return {"ok": True, "resaved": resaved, "failed": failed, "skipped": skipped, "results": results}
+
+
+# ---------------------------------------------------------------------------
 # GOOGLE OAUTH (Elite tier) — Calendar booking + Business Profile sync.
 # One OAuth app registered under Recall's own Google Cloud project; each
 # customer authorizes their own Google account via the real Google consent
