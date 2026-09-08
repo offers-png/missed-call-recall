@@ -324,6 +324,32 @@ async def add_location(
     }
 
 
+@app.post("/locations/{location_id}/update")
+def update_location(
+    location_id: str,
+    customer_id: str = Form(...),
+    location_label: str = Form(...),
+    business_phone: str = Form(...),
+    authorization: str = Header(None),
+):
+    """Renames a location and/or updates the business phone it forwards
+    from. Lets the location-setup page be one continuous flow — the same
+    place you create a location is the same place you can fix its name or
+    forwarding number later, no separate admin screen needed."""
+    require_auth(customer_id, authorization)
+    loc = sb.table(TABLE_LOC).select("id, customer_id").eq("id", location_id).execute()
+    if not loc.data or loc.data[0]["customer_id"] != customer_id:
+        raise HTTPException(404, "Location not found for this account.")
+    location_label = location_label.strip()
+    if not location_label:
+        raise HTTPException(400, "Location name can't be empty.")
+    sb.table(TABLE_LOC).update({
+        "location_label": location_label,
+        "business_phone": business_phone,
+    }).eq("id", location_id).execute()
+    return {"ok": True, "location_id": location_id, "location_label": location_label, "business_phone": business_phone}
+
+
 @app.post("/locations/{location_id}/delete")
 def delete_location(location_id: str, customer_id: str = Form(...), permanent: bool = Form(True), authorization: str = Header(None)):
     """Removes a location. Two modes:
