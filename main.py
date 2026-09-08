@@ -22,7 +22,7 @@ from datetime import datetime, timezone, timedelta
 import jwt
 import requests
 from fastapi import FastAPI, Request, Form, HTTPException, Header, UploadFile, File
-from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi.responses import PlainTextResponse, JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from twilio.twiml.voice_response import VoiceResponse, Dial
 from twilio.rest import Client as TwilioClient
@@ -2520,3 +2520,103 @@ def list_port_requests(authorization: str = Header(None)):
     require_admin(authorization)
     rows = sb.table("recall_port_requests").select("*, recall_customers(business_name)").order("created_at", desc=True).execute()
     return rows.data
+
+
+# ---------------------------------------------------------------------------
+# LEGAL PAGES — Privacy Policy & Terms for SMS, one per customer.
+#
+# Twilio requires a live, publicly accessible Privacy Policy and Terms &
+# Conditions URL for every A2P 10DLC registration — this applies to the
+# CURRENT shared-number setup just as much as any future per-customer ISV
+# registration, so this doesn't wait on the EIN or anything else. Each page
+# names the real business (not "Recall") since that's who's actually
+# texting the caller. Content follows Twilio/CTIA's own required-clause
+# checklist: message purpose, frequency, data rates, STOP/HELP, carrier
+# non-liability, and — the single most-checked clause — an explicit "we
+# never sell or share your opt-in data" statement in the privacy policy.
+# ---------------------------------------------------------------------------
+def _get_customer_for_legal(customer_id: str) -> dict:
+    cust = sb.table(TABLE_CUST).select("business_name, owner_name, email, business_phone").eq("id", customer_id).execute()
+    if not cust.data:
+        raise HTTPException(404, "Not found")
+    return cust.data[0]
+
+
+def _legal_page_shell(title: str, business_name: str, body_html: str) -> str:
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>{title} — {business_name}</title>
+<style>
+  body {{ font-family: -apple-system, Segoe UI, Roboto, sans-serif; max-width: 680px; margin: 40px auto; padding: 0 20px; color: #1a1a1a; line-height: 1.6; }}
+  h1 {{ font-size: 24px; margin-bottom: 4px; }}
+  h2 {{ font-size: 16px; margin-top: 28px; }}
+  .updated {{ color: #777; font-size: 13px; margin-bottom: 24px; }}
+  a {{ color: #1f5fa8; }}
+</style>
+</head>
+<body>
+{body_html}
+</body>
+</html>"""
+
+
+@app.get("/legal/sms-terms/{customer_id}", response_class=HTMLResponse)
+def sms_terms(customer_id: str):
+    c = _get_customer_for_legal(customer_id)
+    business_name = c["business_name"]
+    contact = c.get("email") or c.get("business_phone") or "our office"
+    body = f"""
+<h1>SMS Terms &amp; Conditions</h1>
+<p class="updated">{business_name}</p>
+<p>These terms apply to text messages sent and received between you and <strong>{business_name}</strong> through our missed-call and appointment messaging service.</p>
+
+<h2>What you'll receive</h2>
+<p>Messages related to missed calls, appointment confirmations, reminders, and responses to questions you text us. These are service messages, not marketing.</p>
+
+<h2>Message frequency</h2>
+<p>Message frequency varies based on your interactions with us (for example, missing a call or booking an appointment).</p>
+
+<h2>Cost</h2>
+<p>Message and data rates may apply. Carriers are not liable for delayed or undelivered messages.</p>
+
+<h2>Opt out</h2>
+<p>Reply <strong>STOP</strong> at any time to cancel. After you send STOP, we will send one final message confirming you've been unsubscribed, and you will not receive further messages from us. If you want to start again, just text us or opt in again the same way you did the first time.</p>
+
+<h2>Help</h2>
+<p>Reply <strong>HELP</strong> for help, or contact us directly at {contact}.</p>
+
+<h2>Privacy</h2>
+<p>See our <a href="{PUBLIC_BASE_URL}/legal/sms-privacy/{customer_id}">Privacy Policy</a> for how we handle your information.</p>
+"""
+    return _legal_page_shell("SMS Terms & Conditions", business_name, body)
+
+
+@app.get("/legal/sms-privacy/{customer_id}", response_class=HTMLResponse)
+def sms_privacy(customer_id: str):
+    c = _get_customer_for_legal(customer_id)
+    business_name = c["business_name"]
+    contact = c.get("email") or c.get("business_phone") or "our office"
+    body = f"""
+<h1>SMS Privacy Policy</h1>
+<p class="updated">{business_name}</p>
+<p>This policy explains how <strong>{business_name}</strong> handles information collected through text messaging.</p>
+
+<h2>What we collect</h2>
+<p>Your mobile phone number, your name if you provide it, and the content of the messages you send us.</p>
+
+<h2>How we use it</h2>
+<p>Solely to respond to your calls and texts — sending missed-call replies, confirming or reminding you about appointments, and answering questions you ask us directly.</p>
+
+<h2>We do not sell or share your data</h2>
+<p><strong>No mobile information will be shared with third parties or affiliates for marketing or promotional purposes at any time.</strong> All other categories exclude text messaging originator opt-in data and consent; this information will not be shared with any third parties.</p>
+
+<h2>How long we keep it</h2>
+<p>For as long as needed to provide this service and to comply with applicable recordkeeping requirements.</p>
+
+<h2>Questions</h2>
+<p>Contact us at {contact}. See also our <a href="{PUBLIC_BASE_URL}/legal/sms-terms/{customer_id}">SMS Terms &amp; Conditions</a>.</p>
+"""
+    return _legal_page_shell("SMS Privacy Policy", business_name, body)
