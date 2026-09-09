@@ -709,7 +709,75 @@ async def stripe_webhook(request: Request):
 
 
 # ---------------------------------------------------------------------------
-# SETTINGS — lets a customer view/edit a location's auto-reply message.
+# ACCOUNT — the customer's own account-level info: business name, owner
+# name, contact phone, and business address. Distinct from per-location
+# /settings (auto-reply) and /locations (phone numbers) — this is the one
+# place that maps to "my account" rather than "this location."
+# Also handles password changes (separate endpoint, requires current
+# password) so account.html can be a single self-service page instead of
+# something only Saleh can do via direct DB access.
+# ---------------------------------------------------------------------------
+@app.get("/account/{customer_id}")
+def get_account(customer_id: str, authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    cust = sb.table(TABLE_CUST).select(
+        "business_name, owner_name, email, business_phone, "
+        "address_line1, address_city, address_state, address_zip, tier, status"
+    ).eq("id", customer_id).execute()
+    if not cust.data:
+        raise HTTPException(404, "Not found")
+    return cust.data[0]
+
+
+@app.post("/account/{customer_id}")
+def update_account(
+    customer_id: str,
+    business_name: str = Form(...),
+    owner_name: str = Form(...),
+    business_phone: str = Form(...),
+    address_line1: str = Form(""),
+    address_city: str = Form(""),
+    address_state: str = Form(""),
+    address_zip: str = Form(""),
+    authorization: str = Header(None),
+):
+    require_auth(customer_id, authorization)
+    business_name = business_name.strip()
+    owner_name = owner_name.strip()
+    if not business_name or not owner_name:
+        raise HTTPException(400, "Business name and your name can't be empty.")
+    sb.table(TABLE_CUST).update({
+        "business_name": business_name,
+        "owner_name": owner_name,
+        "business_phone": business_phone.strip(),
+        "address_line1": address_line1.strip(),
+        "address_city": address_city.strip(),
+        "address_state": address_state.strip(),
+        "address_zip": address_zip.strip(),
+    }).eq("id", customer_id).execute()
+    return {"ok": True}
+
+
+@app.post("/account/{customer_id}/password")
+def change_password(
+    customer_id: str,
+    current_password: str = Form(...),
+    new_password: str = Form(...),
+    authorization: str = Header(None),
+):
+    require_auth(customer_id, authorization)
+    if len(new_password) < 8:
+        raise HTTPException(400, "New password must be at least 8 characters.")
+    cust = sb.table(TABLE_CUST).select("password_hash").eq("id", customer_id).execute()
+    if not cust.data or not cust.data[0].get("password_hash"):
+        raise HTTPException(404, "Not found")
+    if not verify_password(current_password, cust.data[0]["password_hash"]):
+        raise HTTPException(401, "Your current password is incorrect.")
+    sb.table(TABLE_CUST).update({"password_hash": hash_password(new_password)}).eq("id", customer_id).execute()
+    return {"ok": True}
+
+
+
 # Optional location_id (query/form param) selects which location; defaults
 # to the account's primary location if omitted, so old frontend calls keep
 # working unchanged.
