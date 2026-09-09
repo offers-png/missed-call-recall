@@ -71,7 +71,7 @@ TWILIO_MESSAGING_SERVICE_SID = os.environ.get("TWILIO_MESSAGING_SERVICE_SID", "M
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://main-backend-k32m.onrender.com")
 # The Netlify site where index.html / dashboard.html actually live. This is
 # what customers should land on after paying — the backend has no UI of its own.
-FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "https://glowing-hotteok-00a881.netlify.app")
+FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "https://callskept.com")
 # Shared secret ElevenLabs sends back on every tool webhook call, so random
 # strangers can't hit these booking endpoints just by guessing the URL.
 ELEVENLABS_TOOL_SECRET = os.environ.get("ELEVENLABS_TOOL_SECRET")
@@ -158,7 +158,7 @@ def require_elevenlabs():
 def el_headers():
     return {"xi-api-key": ELEVENLABS_API_KEY}
 
-app = FastAPI(title="Recall - Missed Call Recovery")
+app = FastAPI(title="CallsKept - Missed Call Recovery")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # tighten to your Netlify domain once live
@@ -2162,7 +2162,7 @@ def _create_calendar_booking(location: dict, location_id: str, date_str: str, ti
         headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
         json={
             "summary": f"{caller_name} — {location['business_name']} appointment",
-            "description": f"Booked by Recall AI. Caller phone: {caller_phone}",
+            "description": f"Booked by CallsKept AI. Caller phone: {caller_phone}",
             "start": {"dateTime": start.isoformat()},
             "end": {"dateTime": end.isoformat()},
         },
