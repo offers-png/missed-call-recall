@@ -3003,6 +3003,49 @@ def crm_update_contact(customer_id: str, contact_id: str, payload: ContactPatch,
     return r.data
 
 
+class SmsCreate(BaseModel):
+    body: str
+
+
+@app.post("/crm/{customer_id}/contacts/{contact_id}/sms")
+def crm_send_sms(customer_id: str, contact_id: str, payload: SmsCreate, authorization: str = Header(None)):
+    """Owner texts a contact from the CallsKept number, so the reply comes
+    back into the same thread (and the AI sees it as context). Goes through
+    send_customer_sms, so opted-out contacts are blocked and logged."""
+    require_auth(customer_id, authorization)
+    require_twilio()
+    contact = _get_contact_or_404(customer_id, contact_id)
+    body = (payload.body or "").strip()
+    if not body:
+        raise HTTPException(422, "Write a message first.")
+    if len(body) > 1000:
+        raise HTTPException(422, "That message is too long — keep it under 1,000 characters.")
+    if contact.get("opted_out"):
+        raise HTTPException(409, "This contact texted STOP, so CallsKept can't text them until they reply START.")
+    try:
+        loc = get_location_for_customer(customer_id, contact.get("location_id"))
+    except HTTPException:
+        loc = get_primary_location(customer_id)
+    if not loc.get("twilio_number"):
+        raise HTTPException(409, "This location doesn't have a CallsKept number yet.")
+    try:
+        sid = send_customer_sms(customer_id, contact["phone"], loc["twilio_number"], body,
+                                location_id=loc["id"], kind="owner_manual")
+    except Exception as e:
+        log.error(f"Owner SMS failed for contact {contact_id}: {e}")
+        raise HTTPException(502, "The text couldn't be sent — please try again in a minute.")
+    if not sid:
+        raise HTTPException(409, "This contact texted STOP, so CallsKept can't text them until they reply START.")
+    try:
+        sb.table("recall_sms_messages").insert({
+            "location_id": loc["id"], "customer_id": customer_id,
+            "direction": "outbound", "from_number": loc["twilio_number"], "body": body,
+        }).execute()
+    except Exception as e:
+        log.error(f"Couldn't mirror owner SMS into recall_sms_messages: {e}")
+    return {"ok": True, "sid": sid, "from_number": loc["twilio_number"]}
+
+
 @app.post("/crm/{customer_id}/contacts/{contact_id}/notes")
 def crm_add_note(customer_id: str, contact_id: str, payload: NoteCreate, authorization: str = Header(None)):
     require_auth(customer_id, authorization)
