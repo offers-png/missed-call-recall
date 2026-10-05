@@ -220,6 +220,94 @@ def get_location_by_number(twilio_number: str) -> dict:
     return merged
 
 
+# ---------------------------------------------------------------------------
+# CRM CORE — every caller/texter becomes one recall_contacts row with a
+# timeline in recall_contact_activities. The heavy lifting (E.164 normalize,
+# upsert on (customer_id, phone), dedupe by source_ref, never-backward status
+# rules, STOP/START handling, status_change logging) lives in the Postgres
+# function recall_crm_log_event so it's atomic and shared with the backfill.
+#
+# RULE: every text to a CUSTOMER (not the owner) goes through
+# send_customer_sms() — that's the single opt-out guard. Future follow-up /
+# quote-recovery features must use it too.
+# ---------------------------------------------------------------------------
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+OPT_OUT_WORDS = {"STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"}
+OPT_IN_WORDS = {"START", "UNSTOP"}
+
+
+def sms_keyword(body: str) -> str:
+    return re.sub(r"[^A-Za-z]", "", body or "").upper()
+
+
+def normalize_e164(raw: str) -> str:
+    """Mirrors the SQL recall_normalize_phone(). Returns None if unusable."""
+    raw = (raw or "").strip()
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) < 10:
+        return None
+    if len(digits) == 10:
+        return "+1" + digits
+    if len(digits) == 11 and digits.startswith("1"):
+        return "+" + digits
+    if raw.startswith("+") and 8 <= len(digits) <= 15:
+        return "+" + digits
+    return None
+
+
+def upsert_contact_and_log(customer_id, phone, activity_type, body=None, metadata=None,
+                           source=None, location_id=None, name=None, source_ref=None,
+                           created_at=None):
+    """Find-or-create the contact, add a timeline entry, apply status rules.
+    Returns contact_id, or None. Never raises — CRM logging must not break
+    call/SMS handling."""
+    if not customer_id or not phone:
+        return None
+    try:
+        r = sb.rpc("recall_crm_log_event", {
+            "p_customer_id": customer_id,
+            "p_phone": phone,
+            "p_type": activity_type,
+            "p_body": body,
+            "p_metadata": metadata or {},
+            "p_source": source,
+            "p_location_id": location_id,
+            "p_name": name,
+            "p_source_ref": source_ref,
+            "p_created_at": created_at,
+        }).execute()
+        return r.data
+    except Exception as e:
+        log.error(f"CRM log failed ({activity_type}, customer {customer_id}): {e}")
+        return None
+
+
+def send_customer_sms(customer_id: str, to: str, from_: str, body: str,
+                      location_id: str = None, kind: str = "manual", name: str = None):
+    """The ONE outbound path for texts to a customer's contacts. Checks the
+    opt-out guard first (blocked sends are logged on the contact's timeline),
+    then sends via Twilio and logs an sms_out activity.
+    Returns the Twilio message SID, or None if blocked.
+    Raises on Twilio errors so callers keep their existing error handling."""
+    try:
+        allowed = sb.rpc("recall_crm_can_text", {
+            "p_customer_id": customer_id, "p_phone": to, "p_body": body, "p_reason": kind,
+        }).execute().data
+    except Exception as e:
+        # Fail closed: texting someone who opted out is a carrier/TCPA problem.
+        log.error(f"Opt-out check failed for customer {customer_id} — not sending: {e}")
+        raise RuntimeError("opt-out check unavailable")
+    if allowed is False:
+        log.info(f"Blocked {kind} text to opted-out contact (customer {customer_id})")
+        return None
+
+    sms = twilio_client.messages.create(to=to, from_=from_, body=body)
+    upsert_contact_and_log(customer_id, to, "sms_out", body=body,
+                           metadata={"kind": kind, "twilio_sid": sms.sid},
+                           location_id=location_id, name=name, source_ref=f"tw:{sms.sid}")
+    return sms.sid
+
+
 @app.get("/health")
 def health():
     return {"ok": True, "service": "recall"}
@@ -592,20 +680,35 @@ async def send_missed_call_text(to_number: str, caller: str, call_sid: str):
 
     message = location["reply_template"].replace("{business_name}", location["business_name"])
     call_row = {
+        "customer_id": location["customer_id"],  # NOT NULL — was missing, so every insert failed
         "location_id": location["location_id"],
         "caller_number": caller,
         "call_sid": call_sid,
         "sms_body": message,
     }
+
+    upsert_contact_and_log(
+        location["customer_id"], caller, "missed_call",
+        metadata={"call_sid": call_sid, "to_number": to_number},
+        source="missed_call", location_id=location["location_id"],
+        source_ref=f"call:{call_sid}" if call_sid else None,
+    )
+
     try:
-        sms = twilio_client.messages.create(to=caller, from_=to_number, body=message)
-        call_row["sms_sent"] = True
-        call_row["sms_sid"] = sms.sid
+        sid = send_customer_sms(location["customer_id"], caller, to_number, message,
+                                location_id=location["location_id"], kind="missed_call_text")
+        call_row["sms_sent"] = bool(sid)
+        call_row["sms_sid"] = sid
+        if not sid:
+            call_row["sms_error"] = "skipped: contact opted out"
     except Exception as e:
         log.error(f"SMS send failed for {caller}: {e}")
         call_row["sms_sent"] = False
         call_row["sms_error"] = str(e)
-    sb.table(TABLE_CALLS).insert(call_row).execute()
+    try:
+        sb.table(TABLE_CALLS).insert(call_row).execute()
+    except Exception as e:
+        log.error(f"Couldn't save missed-call row for {call_sid}: {e}")
 
 
 @app.post("/twilio/dial-result")
@@ -967,8 +1070,9 @@ async def update_appointment(appointment_id: str, request: Request):
     sent = False
     if row.get("caller_phone"):
         try:
-            twilio_client.messages.create(to=row["caller_phone"], from_=twilio_number, body=message)
-            sent = True
+            sent = bool(send_customer_sms(customer_id, row["caller_phone"], twilio_number, message,
+                                          location_id=row.get("location_id"), kind=f"appointment_{action}",
+                                          name=row.get("caller_name")))
         except Exception as e:
             log.error(f"Appointment-update SMS failed for appointment {appointment_id}: {e}")
 
@@ -1098,15 +1202,44 @@ async def twilio_sms(request: Request):
         "direction": "inbound", "from_number": from_number, "body": body,
     }).execute()
 
-    history = (
-        sb.table("recall_sms_messages")
-        .select("direction, body")
-        .eq("location_id", location["location_id"])
-        .order("created_at", desc=True)
-        .limit(SMS_HISTORY_LIMIT)
-        .execute()
+    message_sid = form.get("MessageSid") or form.get("SmsSid")
+    contact_id = upsert_contact_and_log(
+        location["customer_id"], from_number, "sms_in", body=body,
+        metadata={"twilio_sid": message_sid}, source="sms",
+        location_id=location["location_id"],
+        source_ref=f"tw:{message_sid}" if message_sid else None,
     )
-    turns = list(reversed(history.data))
+
+    # Opt-out / opt-in keywords: the CRM call above already flipped opted_out
+    # and logged it. Twilio sends the carrier-required confirmation itself, so
+    # the AI must NOT reply to these.
+    if sms_keyword(body) in OPT_OUT_WORDS | OPT_IN_WORDS:
+        return PlainTextResponse("", media_type="application/xml")
+
+    # Conversation history for THIS caller only. (Previously this pulled the
+    # last N texts for the whole location, so two customers texting the same
+    # number would see each other's messages in the AI's context.)
+    turns = []
+    if contact_id:
+        try:
+            hist = (
+                sb.table("recall_contact_activities")
+                .select("type, body")
+                .eq("contact_id", contact_id)
+                .in_("type", ["sms_in", "sms_out"])
+                .order("created_at", desc=True)
+                .limit(SMS_HISTORY_LIMIT)
+                .execute()
+            )
+            turns = [{"direction": "inbound" if h["type"] == "sms_in" else "outbound", "body": h["body"]}
+                     for h in reversed(hist.data) if h.get("body")]
+        except Exception as e:
+            log.error(f"SMS history lookup failed for contact {contact_id}: {e}")
+    if not turns or turns[-1]["direction"] != "inbound":
+        turns.append({"direction": "inbound", "body": body})
+    # Anthropic requires the conversation to start with a user turn
+    while turns and turns[0]["direction"] != "inbound":
+        turns.pop(0)
 
     business_info = location.get("business_info_text") or "No business information has been provided yet."
     can_book = location.get("tier") == "elite" and bool(location.get("google_calendar_refresh_token"))
@@ -1235,7 +1368,10 @@ async def twilio_sms(request: Request):
         reply_text = "Sorry, I'm having trouble answering right now — please call us directly."
 
     try:
-        twilio_client.messages.create(to=from_number, from_=to_number, body=reply_text)
+        sid = send_customer_sms(location["customer_id"], from_number, to_number, reply_text,
+                                location_id=location["location_id"], kind="ai_sms_reply")
+        if not sid:
+            return PlainTextResponse("", media_type="application/xml")
         sb.table("recall_sms_messages").insert({
             "location_id": location["location_id"], "customer_id": location["customer_id"],
             "direction": "outbound", "from_number": to_number, "body": reply_text,
@@ -1324,9 +1460,9 @@ async def send_reminders(request: Request):
                 f"today at {local_time}. See you soon!"
             )
             try:
-                twilio_client.messages.create(
-                    to=appt["caller_phone"], from_=loc["twilio_number"], body=message
-                )
+                # Marked sent even if blocked by opt-out, so a blocked reminder isn't retried every run.
+                send_customer_sms(appt["customer_id"], appt["caller_phone"], loc["twilio_number"], message,
+                                  location_id=appt.get("location_id"), kind="appointment_reminder")
                 updates["reminder_text_sent"] = True
             except Exception as e:
                 log.error(f"Reminder text failed for appointment {appt['id']}: {e}")
@@ -2241,18 +2377,29 @@ def _create_calendar_booking(location: dict, location_id: str, date_str: str, ti
         return "I couldn't book that — please offer to take a message instead."
     log.info(f"book-appointment success, event id: {resp.json().get('id')}")
 
+    appt_id = None
     try:
-        sb.table("recall_appointments").insert({
+        ins = sb.table("recall_appointments").insert({
             "location_id": location_id,
             "customer_id": location["customer_id"],
             "caller_name": caller_name,
             "caller_phone": caller_phone,
             "appointment_start": start.isoformat(),
         }).execute()
+        appt_id = (ins.data or [{}])[0].get("id")
     except Exception as e:
         # Booking itself already succeeded on the real calendar — don't
         # fail the whole tool call just because the reminder record failed.
         log.error(f"Couldn't save appointment record for reminders (location {location_id}): {e}")
+
+    upsert_contact_and_log(
+        location["customer_id"], caller_phone, "booking",
+        body=f"Appointment booked for {start.strftime('%a %b %-d, %-I:%M %p')}",
+        metadata={"appointment_start": start.isoformat(), "appointment_id": appt_id,
+                  "calendar_event_id": resp.json().get("id")},
+        source="ai_call", location_id=location_id, name=caller_name,
+        source_ref=f"appt:{appt_id}" if appt_id else None,
+    )
 
     return f"Booked for {caller_name} on {date_str} at {time_str}. Confirmed."
 
@@ -2404,14 +2551,24 @@ async def tool_notify_owner(location_id: str, request: Request):
     location = {**customer, **row}
     target = location.get("transfer_phone") or location.get("business_phone")
 
+    note_text = (reason or "Caller requested to be connected.") + (" (EMERGENCY)" if is_emergency else "")
+    msg_id = None
     try:
-        sb.table("recall_messages").insert({
+        ins = sb.table("recall_messages").insert({
             "customer_id": location["customer_id"],
             "caller_phone": caller_phone or "unknown",
-            "note": (reason or "Caller requested to be connected.") + (" (EMERGENCY)" if is_emergency else ""),
+            "note": note_text,
         }).execute()
+        msg_id = (ins.data or [{}])[0].get("id")
     except Exception as e:
         log.error(f"notify-owner recall_messages insert failed for location {location_id}: {e}")
+    upsert_contact_and_log(
+        location["customer_id"], caller_phone, "ai_call",
+        body=f"AI transferred the call to the owner — {note_text}",
+        metadata={"kind": "transfer", "is_emergency": is_emergency, "message_id": msg_id},
+        source="ai_call", location_id=location_id,
+        source_ref=f"msg:{msg_id}" if msg_id else None,
+    )
 
     if not target:
         return {"result": "No transfer contact number is configured — proceed with the transfer anyway."}
@@ -2458,15 +2615,23 @@ async def tool_take_message(location_id: str, request: Request):
     location = {**customer, **row}
 
     try:
-        sb.table("recall_messages").insert({
+        ins = sb.table("recall_messages").insert({
             "customer_id": location["customer_id"],
             "caller_name": caller_name or None,
             "caller_phone": caller_phone,
             "note": note or None,
         }).execute()
+        msg_id = (ins.data or [{}])[0].get("id")
     except Exception as e:
         log.error(f"take-message save failed for location {location_id}: {e}")
         return {"result": "Couldn't save that message — apologize and let them know someone will follow up."}
+    upsert_contact_and_log(
+        location["customer_id"], caller_phone, "ai_call",
+        body=f"AI took a callback request — {note}" if note else "AI took a callback request.",
+        metadata={"kind": "take_message", "message_id": msg_id},
+        source="ai_call", location_id=location_id, name=caller_name or None,
+        source_ref=f"msg:{msg_id}" if msg_id else None,
+    )
 
     target = location.get("transfer_phone") or location.get("business_phone")
     if target:
@@ -2688,3 +2853,323 @@ def sms_privacy(customer_id: str):
 <p>Contact us at {contact}. See also our <a href="{PUBLIC_BASE_URL}/legal/sms-terms/{customer_id}">SMS Terms &amp; Conditions</a>.</p>
 """
     return _legal_page_shell("SMS Privacy Policy", business_name, body)
+
+
+# ===========================================================================
+# CRM — Phase 1. Contacts, timeline, notes, tasks, job value.
+# All /crm/{customer_id}/... routes use the same Bearer-token check as
+# /account/{customer_id}, and every query is pinned to that customer_id, so
+# one account can never read another's contacts (mismatched ids → 404).
+# ===========================================================================
+from typing import Optional
+from pydantic import BaseModel
+
+CRM_STATUSES = ("new", "contacted", "qualified", "booked", "won", "lost", "do_not_contact")
+
+
+def _require_uuid(value: str, what: str = "Not found"):
+    if not value or not UUID_RE.match(value):
+        raise HTTPException(404, what)
+
+
+def _get_contact_or_404(customer_id: str, contact_id: str) -> dict:
+    _require_uuid(contact_id, "Contact not found")
+    r = (sb.table("recall_contacts").select("*")
+         .eq("id", contact_id).eq("customer_id", customer_id).limit(1).execute())
+    if not r.data:
+        raise HTTPException(404, "Contact not found")
+    return r.data[0]
+
+
+class ContactCreate(BaseModel):
+    phone: str
+    name: Optional[str] = None
+    email: Optional[str] = None
+    location_id: Optional[str] = None
+    note: Optional[str] = None
+
+
+class ContactPatch(BaseModel):
+    name: Optional[str] = None
+    email: Optional[str] = None
+    status: Optional[str] = None
+    job_value: Optional[float] = None
+    lost_reason: Optional[str] = None
+
+
+class NoteCreate(BaseModel):
+    body: str
+
+
+class TaskCreate(BaseModel):
+    title: str
+    due_at: Optional[str] = None  # ISO 8601
+
+
+class TaskPatch(BaseModel):
+    title: Optional[str] = None
+    due_at: Optional[str] = None
+    done: Optional[bool] = None
+
+
+@app.get("/crm/{customer_id}/contacts")
+def crm_list_contacts(customer_id: str, status: str = None, q: str = None, location_id: str = None,
+                      page: int = 1, limit: int = 50, authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    if status and status not in CRM_STATUSES:
+        raise HTTPException(422, f"status must be one of {', '.join(CRM_STATUSES)}")
+    if location_id:
+        get_location_for_customer(customer_id, location_id)  # 404s if not theirs
+    limit = max(1, min(int(limit or 50), 200))
+    page = max(1, int(page or 1))
+    r = sb.rpc("recall_crm_list_contacts", {
+        "p_customer_id": customer_id, "p_status": status, "p_q": (q or "")[:80] or None,
+        "p_location_id": location_id, "p_limit": limit, "p_offset": (page - 1) * limit,
+    }).execute()
+    data = r.data or {}
+    return {**data, "page": page, "limit": limit}
+
+
+@app.post("/crm/{customer_id}/contacts")
+def crm_create_contact(customer_id: str, payload: ContactCreate, authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    phone = normalize_e164(payload.phone)
+    if not phone:
+        raise HTTPException(422, "That phone number doesn't look right — include the area code.")
+    if payload.location_id:
+        get_location_for_customer(customer_id, payload.location_id)
+    existing = (sb.table("recall_contacts").select("id")
+                .eq("customer_id", customer_id).eq("phone", phone).limit(1).execute())
+    if existing.data:
+        raise HTTPException(409, {"message": "A contact with that phone number already exists.",
+                                  "contact_id": existing.data[0]["id"]})
+    row = {
+        "customer_id": customer_id, "phone": phone, "source": "manual",
+        "name": (payload.name or "").strip() or None,
+        "email": (payload.email or "").strip() or None,
+        "location_id": payload.location_id,
+    }
+    created = sb.table("recall_contacts").insert(row).execute().data[0]
+    if (payload.note or "").strip():
+        sb.table("recall_contact_activities").insert({
+            "contact_id": created["id"], "customer_id": customer_id,
+            "type": "note", "body": payload.note.strip()[:5000],
+        }).execute()
+    return created
+
+
+@app.get("/crm/{customer_id}/contacts/{contact_id}")
+def crm_get_contact(customer_id: str, contact_id: str, authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    contact = _get_contact_or_404(customer_id, contact_id)
+    activities = (sb.table("recall_contact_activities")
+                  .select("id, type, body, metadata, created_at")
+                  .eq("contact_id", contact_id).eq("customer_id", customer_id)
+                  .order("created_at", desc=True).limit(500).execute())
+    tasks = (sb.table("recall_tasks").select("*")
+             .eq("contact_id", contact_id).eq("customer_id", customer_id)
+             .order("done_at", desc=False, nullsfirst=True).order("due_at").execute())
+    return {"contact": contact, "activities": activities.data, "tasks": tasks.data}
+
+
+@app.patch("/crm/{customer_id}/contacts/{contact_id}")
+def crm_update_contact(customer_id: str, contact_id: str, payload: ContactPatch,
+                       authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    _require_uuid(contact_id, "Contact not found")
+    patch = payload.model_dump(exclude_unset=True) if hasattr(payload, "model_dump") else payload.dict(exclude_unset=True)
+    if not patch:
+        raise HTTPException(422, "Nothing to update.")
+    if "status" in patch and patch["status"] not in CRM_STATUSES:
+        raise HTTPException(422, f"status must be one of {', '.join(CRM_STATUSES)}")
+    if patch.get("email") and "@" not in patch["email"]:
+        raise HTTPException(422, "That email address doesn't look right.")
+    try:
+        r = sb.rpc("recall_crm_update_contact", {
+            "p_customer_id": customer_id, "p_contact_id": contact_id, "p_patch": patch,
+        }).execute()
+    except Exception as e:
+        msg = str(e)
+        if "contact_not_found" in msg:
+            raise HTTPException(404, "Contact not found")
+        if "job_value_required_for_won" in msg:
+            raise HTTPException(422, "Enter the job amount to mark this contact Won.")
+        if "job_value_negative" in msg:
+            raise HTTPException(422, "Job value can't be negative.")
+        if "invalid_status" in msg:
+            raise HTTPException(422, "Invalid status.")
+        log.exception(f"CRM update failed for contact {contact_id}")
+        raise HTTPException(500, "Couldn't save that change — please try again.")
+    return r.data
+
+
+@app.post("/crm/{customer_id}/contacts/{contact_id}/notes")
+def crm_add_note(customer_id: str, contact_id: str, payload: NoteCreate, authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    _get_contact_or_404(customer_id, contact_id)
+    body = (payload.body or "").strip()
+    if not body:
+        raise HTTPException(422, "Note can't be empty.")
+    note = sb.table("recall_contact_activities").insert({
+        "contact_id": contact_id, "customer_id": customer_id, "type": "note", "body": body[:5000],
+    }).execute().data[0]
+    sb.table("recall_contacts").update({"last_activity_at": note["created_at"]}).eq("id", contact_id).execute()
+    return note
+
+
+def _parse_due(due_at: Optional[str]):
+    if not due_at:
+        return None
+    try:
+        dt = datetime.fromisoformat(due_at.replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(422, "due_at must be an ISO date/time.")
+    if dt.tzinfo is None:
+        from zoneinfo import ZoneInfo
+        dt = dt.replace(tzinfo=ZoneInfo(BUSINESS_TZ))
+    return dt.isoformat()
+
+
+@app.post("/crm/{customer_id}/contacts/{contact_id}/tasks")
+def crm_create_task(customer_id: str, contact_id: str, payload: TaskCreate, authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    _get_contact_or_404(customer_id, contact_id)
+    title = (payload.title or "").strip()
+    if not title:
+        raise HTTPException(422, "Task needs a title.")
+    return sb.table("recall_tasks").insert({
+        "contact_id": contact_id, "customer_id": customer_id,
+        "title": title[:300], "due_at": _parse_due(payload.due_at),
+    }).execute().data[0]
+
+
+@app.patch("/crm/{customer_id}/tasks/{task_id}")
+def crm_update_task(customer_id: str, task_id: str, payload: TaskPatch, authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    _require_uuid(task_id, "Task not found")
+    existing = (sb.table("recall_tasks").select("id")
+                .eq("id", task_id).eq("customer_id", customer_id).limit(1).execute())
+    if not existing.data:
+        raise HTTPException(404, "Task not found")
+    fields = payload.model_dump(exclude_unset=True) if hasattr(payload, "model_dump") else payload.dict(exclude_unset=True)
+    updates = {}
+    if "title" in fields:
+        if not (fields["title"] or "").strip():
+            raise HTTPException(422, "Task needs a title.")
+        updates["title"] = fields["title"].strip()[:300]
+    if "due_at" in fields:
+        updates["due_at"] = _parse_due(fields["due_at"])
+    if "done" in fields:
+        updates["done_at"] = datetime.now(timezone.utc).isoformat() if fields["done"] else None
+    if not updates:
+        raise HTTPException(422, "Nothing to update.")
+    return (sb.table("recall_tasks").update(updates)
+            .eq("id", task_id).eq("customer_id", customer_id).execute()).data[0]
+
+
+@app.get("/crm/{customer_id}/tasks")
+def crm_list_tasks(customer_id: str, open: bool = True, authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    qry = (sb.table("recall_tasks")
+           .select("*, recall_contacts(id, name, phone, status)")
+           .eq("customer_id", customer_id))
+    if open:
+        qry = qry.is_("done_at", "null").order("due_at", nullsfirst=False).order("created_at")
+    else:
+        qry = qry.order("created_at", desc=True)
+    return {"tasks": qry.limit(200).execute().data}
+
+
+@app.get("/crm/{customer_id}/summary")
+def crm_summary(customer_id: str, authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    return sb.rpc("recall_crm_summary", {"p_customer_id": customer_id}).execute().data
+
+
+@app.post("/admin/crm-backfill")
+def admin_crm_backfill(authorization: str = Header(None)):
+    """One-time import of existing calls/texts/messages/appointments into the
+    CRM. Safe to run any number of times — every imported event has a dedupe
+    key, and only history older than each account's first live-logged event
+    is replayed."""
+    require_admin(authorization)
+    return sb.rpc("recall_crm_backfill", {}).execute().data
+
+
+# ---------------------------------------------------------------------------
+# ELEVENLABS POST-CALL WEBHOOK — logs every AI-answered call (with its
+# summary) onto the caller's contact timeline. Configure in ElevenLabs as a
+# post-call transcription webhook pointing at
+#   {PUBLIC_BASE_URL}/elevenlabs/post-call
+# and put its signing secret in Render as ELEVENLABS_WEBHOOK_SECRET.
+# ---------------------------------------------------------------------------
+ELEVENLABS_WEBHOOK_SECRET = os.environ.get("ELEVENLABS_WEBHOOK_SECRET")
+
+
+def _verify_elevenlabs_signature(raw: bytes, header: str) -> bool:
+    if not ELEVENLABS_WEBHOOK_SECRET or not header:
+        return False
+    parts = dict(p.split("=", 1) for p in header.split(",") if "=" in p)
+    ts, sig = parts.get("t"), parts.get("v0")
+    if not ts or not sig:
+        return False
+    try:
+        if abs(datetime.now(timezone.utc).timestamp() - int(ts)) > 30 * 60:
+            return False
+    except ValueError:
+        return False
+    expected = hmac.new(ELEVENLABS_WEBHOOK_SECRET.encode(), f"{ts}.".encode() + raw, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, sig)
+
+
+@app.post("/elevenlabs/post-call")
+async def elevenlabs_post_call(request: Request):
+    raw = await request.body()
+    if not ELEVENLABS_WEBHOOK_SECRET:
+        raise HTTPException(503, "ELEVENLABS_WEBHOOK_SECRET isn't set.")
+    if not _verify_elevenlabs_signature(raw, request.headers.get("elevenlabs-signature")):
+        raise HTTPException(401, "Invalid signature.")
+    import json as _json
+    try:
+        event = _json.loads(raw)
+    except ValueError:
+        raise HTTPException(400, "Bad JSON.")
+    if event.get("type") != "post_call_transcription":
+        return {"ok": True, "ignored": event.get("type")}
+
+    data = event.get("data") or {}
+    conv_id = data.get("conversation_id")
+    meta = data.get("metadata") or {}
+    phone_call = meta.get("phone_call") or {}
+    dyn = ((data.get("conversation_initiation_client_data") or {}).get("dynamic_variables")) or {}
+    caller = phone_call.get("external_number") or dyn.get("system__caller_id")
+    agent_number = phone_call.get("agent_number") or dyn.get("system__called_number")
+
+    location = get_location_by_number(agent_number) if agent_number else None
+    if not location and data.get("agent_id"):
+        loc = (sb.table(TABLE_LOC).select("id, customer_id")
+               .eq("elevenlabs_agent_id", data["agent_id"]).limit(1).execute())
+        if loc.data:
+            location = {"customer_id": loc.data[0]["customer_id"], "location_id": loc.data[0]["id"]}
+    if not location or not caller:
+        log.info(f"post-call {conv_id}: no matching location/caller (agent {data.get('agent_id')})")
+        return {"ok": True, "logged": False}
+
+    analysis = data.get("analysis") or {}
+    summary = (analysis.get("transcript_summary") or "").strip() or "AI answered the call."
+    collected = analysis.get("data_collection_results") or {}
+    name = None
+    for key in ("caller_name", "customer_name", "name"):
+        val = (collected.get(key) or {}).get("value") if isinstance(collected.get(key), dict) else None
+        if val:
+            name = str(val).strip()
+            break
+
+    upsert_contact_and_log(
+        location["customer_id"], caller, "ai_call", body=summary,
+        metadata={"conversation_id": conv_id, "duration_secs": meta.get("call_duration_secs"),
+                  "call_successful": analysis.get("call_successful")},
+        source="ai_call", location_id=location.get("location_id"), name=name,
+        source_ref=f"el:{conv_id}" if conv_id else None,
+    )
+    return {"ok": True, "logged": True}
