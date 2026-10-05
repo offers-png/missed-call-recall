@@ -3046,6 +3046,180 @@ def crm_send_sms(customer_id: str, contact_id: str, payload: SmsCreate, authoriz
     return {"ok": True, "sid": sid, "from_number": loc["twilio_number"]}
 
 
+# ---------------------------------------------------------------------------
+# OUTBOUND CALLS FROM THE CRM — two modes, both from the CallsKept number:
+#   ai_message: the AI voice calls the contact, reads the owner's message,
+#               and offers "press 1" to connect them to the business.
+#   connect:    rings the OWNER's phone first, then bridges to the contact —
+#               click-to-call for owners on a computer.
+# Each call is one call_out activity; Twilio status callbacks update it.
+# ---------------------------------------------------------------------------
+CALL_VOICE = os.environ.get("CALL_VOICE", "Polly.Joanna-Neural")
+CALL_HOURS = (8, 21)  # local 8am–9pm — never robo-call people at night
+
+
+class CallCreate(BaseModel):
+    mode: str  # "ai_message" | "connect"
+    message: Optional[str] = None
+
+
+def _owner_phone(loc: dict, customer_id: str) -> str:
+    if loc.get("transfer_phone"):
+        return loc["transfer_phone"]
+    if loc.get("business_phone"):
+        return loc["business_phone"]
+    cust = sb.table(TABLE_CUST).select("business_phone").eq("id", customer_id).execute()
+    return (cust.data or [{}])[0].get("business_phone")
+
+
+def _call_activity(activity_id: str) -> dict:
+    if not UUID_RE.match(activity_id or ""):
+        return None
+    r = (sb.table("recall_contact_activities")
+         .select("id, contact_id, customer_id, body, metadata, recall_contacts(phone, name)")
+         .eq("id", activity_id).eq("type", "call_out").limit(1).execute())
+    return r.data[0] if r.data else None
+
+
+@app.post("/crm/{customer_id}/contacts/{contact_id}/call")
+def crm_call(customer_id: str, contact_id: str, payload: CallCreate, authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    require_twilio()
+    contact = _get_contact_or_404(customer_id, contact_id)
+    if contact.get("opted_out") or contact.get("status") == "do_not_contact":
+        raise HTTPException(409, "This contact is marked Do Not Contact.")
+    if payload.mode not in ("ai_message", "connect"):
+        raise HTTPException(422, "mode must be 'ai_message' or 'connect'.")
+    try:
+        loc = get_location_for_customer(customer_id, contact.get("location_id"))
+    except HTTPException:
+        loc = get_primary_location(customer_id)
+    if not loc.get("twilio_number"):
+        raise HTTPException(409, "This location doesn't have a CallsKept number yet.")
+    owner = normalize_e164(_owner_phone(loc, customer_id) or "")
+
+    message = (payload.message or "").strip()
+    if payload.mode == "ai_message":
+        if not message:
+            raise HTTPException(422, "Write the message the AI should say.")
+        if len(message) > 600:
+            raise HTTPException(422, "Keep the message under 600 characters — about 40 seconds spoken.")
+        from zoneinfo import ZoneInfo
+        hour = datetime.now(ZoneInfo(BUSINESS_TZ)).hour
+        if not (CALL_HOURS[0] <= hour < CALL_HOURS[1]):
+            raise HTTPException(409, "AI calls only go out between 8 AM and 9 PM. Add a task to call tomorrow instead.")
+    else:
+        if not owner:
+            raise HTTPException(409, "Add your phone number in Phone connection first, so we know which phone to ring.")
+        if owner == contact["phone"]:
+            raise HTTPException(409, "That's your own number.")
+
+    act = sb.table("recall_contact_activities").insert({
+        "contact_id": contact_id, "customer_id": customer_id, "type": "call_out",
+        "body": message or None,
+        "metadata": {"kind": payload.mode, "call_status": "queued", "location_id": loc["id"]},
+    }).execute().data[0]
+
+    to = contact["phone"] if payload.mode == "ai_message" else owner
+    try:
+        call = twilio_client.calls.create(
+            to=to, from_=loc["twilio_number"],
+            url=f"{PUBLIC_BASE_URL}/twilio/crm-call/{act['id']}", method="POST",
+            status_callback=f"{PUBLIC_BASE_URL}/twilio/crm-call-status/{act['id']}",
+            status_callback_event=["completed"], status_callback_method="POST",
+            timeout=25,
+        )
+    except Exception as e:
+        log.error(f"CRM call failed for contact {contact_id}: {e}")
+        sb.table("recall_contact_activities").update({
+            "metadata": {**act["metadata"], "call_status": "failed", "error": str(e)[:200]},
+        }).eq("id", act["id"]).execute()
+        raise HTTPException(502, "The call couldn't be placed — please try again in a minute.")
+
+    sb.table("recall_contact_activities").update({
+        "metadata": {**act["metadata"], "call_status": "ringing", "call_sid": call.sid},
+    }).eq("id", act["id"]).execute()
+    sb.table("recall_contacts").update({"last_activity_at": datetime.now(timezone.utc).isoformat()}).eq("id", contact_id).execute()
+    if contact.get("status") == "new":
+        sb.rpc("recall_crm_update_contact", {"p_customer_id": customer_id, "p_contact_id": contact_id,
+                                             "p_patch": {"status": "contacted"}}).execute()
+    return {"ok": True, "activity_id": act["id"], "dialing": to if payload.mode == "connect" else contact["phone"]}
+
+
+@app.post("/twilio/crm-call/{activity_id}")
+async def crm_call_twiml(activity_id: str):
+    vr = VoiceResponse()
+    act = _call_activity(activity_id)
+    if not act:
+        vr.hangup()
+        return PlainTextResponse(str(vr), media_type="application/xml")
+    meta = act.get("metadata") or {}
+    contact = act.get("recall_contacts") or {}
+    loc = sb.table(TABLE_LOC).select("*, recall_customers(business_name)").eq("id", meta.get("location_id")).execute()
+    row = (loc.data or [{}])[0]
+    business = (row.get("recall_customers") or {}).get("business_name") or "the business"
+
+    if meta.get("kind") == "connect":
+        name = contact.get("name") or "your customer"
+        vr.say(f"CallsKept. Connecting you to {name} now.", voice=CALL_VOICE)
+        dial = Dial(caller_id=row.get("twilio_number"), timeout=25)
+        dial.number(contact.get("phone"))
+        vr.append(dial)
+        return PlainTextResponse(str(vr), media_type="application/xml")
+
+    first = (contact.get("name") or "").split(" ")[0]
+    greeting = f"Hi {first}, this" if first else "Hi, this"
+    gather = vr.gather(num_digits=1, action=f"{PUBLIC_BASE_URL}/twilio/crm-call-gather/{activity_id}",
+                       method="POST", timeout=6)
+    gather.say(f"{greeting} is an automated call from {business}.", voice=CALL_VOICE)
+    gather.pause(length=1)
+    gather.say(act.get("body") or "", voice=CALL_VOICE)
+    gather.pause(length=1)
+    gather.say("To talk with someone now, press 1. Or text this number any time. Thank you.", voice=CALL_VOICE)
+    vr.say("Goodbye.", voice=CALL_VOICE)
+    return PlainTextResponse(str(vr), media_type="application/xml")
+
+
+@app.post("/twilio/crm-call-gather/{activity_id}")
+async def crm_call_gather(activity_id: str, request: Request):
+    form = await request.form()
+    vr = VoiceResponse()
+    act = _call_activity(activity_id)
+    if not act or form.get("Digits") != "1":
+        vr.say("Thank you. Goodbye.", voice=CALL_VOICE)
+        return PlainTextResponse(str(vr), media_type="application/xml")
+    meta = act.get("metadata") or {}
+    loc = sb.table(TABLE_LOC).select("*").eq("id", meta.get("location_id")).execute()
+    row = (loc.data or [{}])[0]
+    owner = _owner_phone(row, act["customer_id"])
+    try:
+        sb.table("recall_contact_activities").update({"metadata": {**meta, "pressed_1": True}}).eq("id", activity_id).execute()
+    except Exception:
+        pass
+    if not owner:
+        vr.say("Sorry, no one is available right now. We'll call you back soon.", voice=CALL_VOICE)
+        return PlainTextResponse(str(vr), media_type="application/xml")
+    vr.say("Connecting you now.", voice=CALL_VOICE)
+    dial = Dial(caller_id=row.get("twilio_number"), timeout=25)
+    dial.number(owner)
+    vr.append(dial)
+    return PlainTextResponse(str(vr), media_type="application/xml")
+
+
+@app.post("/twilio/crm-call-status/{activity_id}")
+async def crm_call_status(activity_id: str, request: Request):
+    form = await request.form()
+    act = _call_activity(activity_id)
+    if act:
+        meta = act.get("metadata") or {}
+        sb.table("recall_contact_activities").update({"metadata": {
+            **meta, "call_status": form.get("CallStatus"),
+            "duration_secs": int(form.get("CallDuration") or 0),
+            "answered_by": form.get("AnsweredBy"),
+        }}).eq("id", activity_id).execute()
+    return PlainTextResponse("", media_type="application/xml")
+
+
 @app.post("/crm/{customer_id}/contacts/{contact_id}/notes")
 def crm_add_note(customer_id: str, contact_id: str, payload: NoteCreate, authorization: str = Header(None)):
     require_auth(customer_id, authorization)
