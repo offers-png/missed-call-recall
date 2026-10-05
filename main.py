@@ -1831,6 +1831,63 @@ def get_agent(customer_id: str, location_id: str = None, authorization: str = He
     }
 
 
+def _el_assign(phone_id: str, agent_id: str):
+    return requests.patch(
+        f"{ELEVENLABS_BASE}/convai/phone-numbers/{phone_id}",
+        headers={**el_headers(), "Content-Type": "application/json"},
+        json={"agent_id": agent_id}, timeout=30,
+    )
+
+
+def _ensure_el_phone_assigned(customer: dict, location: dict, agent_id: str, phone_id: str) -> str:
+    """Assigns agent_id to this location's number in ElevenLabs and returns the
+    (possibly new) ElevenLabs phone_number_id. Raises HTTPException on failure."""
+    if phone_id:
+        resp = _el_assign(phone_id, agent_id)
+        if resp.ok:
+            return phone_id
+        if resp.status_code not in (404, 422) and "not_found" not in resp.text:
+            raise HTTPException(502, f"Couldn't assign the agent to your number: {resp.text[:300]}")
+        log.warning(f"ElevenLabs phone id {phone_id} is stale for {location['twilio_number']} — re-linking")
+
+    # Look for the number already imported under a different id.
+    found = None
+    try:
+        lst = requests.get(f"{ELEVENLABS_BASE}/convai/phone-numbers", headers=el_headers(), timeout=30)
+        if lst.ok:
+            rows = lst.json()
+            rows = rows.get("phone_numbers", rows) if isinstance(rows, dict) else rows
+            want = normalize_e164(location["twilio_number"])
+            for row in rows or []:
+                if normalize_e164(row.get("phone_number") or "") == want:
+                    found = row.get("phone_number_id")
+                    break
+    except Exception as e:
+        log.error(f"Couldn't list ElevenLabs phone numbers: {e}")
+
+    if not found:
+        resp = requests.post(
+            f"{ELEVENLABS_BASE}/convai/phone-numbers",
+            headers={**el_headers(), "Content-Type": "application/json"},
+            json={
+                "provider": "twilio",
+                "phone_number": location["twilio_number"],
+                "label": f"{customer['business_name']} — {location.get('location_label', '')}".strip(" —"),
+                "sid": TWILIO_SID,
+                "token": TWILIO_TOKEN,
+            },
+            timeout=30,
+        )
+        if not resp.ok:
+            raise HTTPException(502, f"Couldn't import your number into ElevenLabs: {resp.text[:300]}")
+        found = resp.json().get("phone_number_id")
+
+    resp = _el_assign(found, agent_id)
+    if not resp.ok:
+        raise HTTPException(502, f"Couldn't assign the agent to your number: {resp.text[:300]}")
+    return found
+
+
 @app.post("/agent/{customer_id}/setup")
 async def setup_agent(
     customer_id: str,
@@ -2085,40 +2142,13 @@ async def setup_agent(
         agent_id = resp.json().get("agent_id")
         update["elevenlabs_agent_id"] = agent_id
 
-    # 3. Import the location's Twilio number into ElevenLabs (first time
-    # only) and assign the agent.
-    phone_id = location.get("elevenlabs_phone_id")
-    if not phone_id:
-        resp = requests.post(
-            f"{ELEVENLABS_BASE}/convai/phone-numbers",
-            headers={**el_headers(), "Content-Type": "application/json"},
-            json={
-                "provider": "twilio",
-                "phone_number": location["twilio_number"],
-                "label": f"{customer['business_name']} — {location.get('location_label', '')}".strip(" —"),
-                "sid": TWILIO_SID,
-                "token": TWILIO_TOKEN,
-            },
-            timeout=30,
-        )
-        if not resp.ok:
-            raise HTTPException(
-                502,
-                f"Couldn't import your number into ElevenLabs: {resp.text[:300]} "
-                "(this is a newer integration — if this keeps failing, send this exact "
-                "message and we'll fix the field names)."
-            )
-        phone_id = resp.json().get("phone_number_id")
+    # 3. Link the location's Twilio number to the agent in ElevenLabs.
+    # Self-healing: if the saved phone-number id no longer exists in ElevenLabs
+    # (number re-imported or removed there), find the number by its digits,
+    # re-import only if it's truly missing, and save the new id.
+    phone_id = _ensure_el_phone_assigned(customer, location, agent_id, location.get("elevenlabs_phone_id"))
+    if phone_id != location.get("elevenlabs_phone_id"):
         update["elevenlabs_phone_id"] = phone_id
-
-    resp = requests.patch(
-        f"{ELEVENLABS_BASE}/convai/phone-numbers/{phone_id}",
-        headers={**el_headers(), "Content-Type": "application/json"},
-        json={"agent_id": agent_id},
-        timeout=30,
-    )
-    if not resp.ok:
-        raise HTTPException(502, f"Couldn't assign the agent to your number: {resp.text[:300]}")
 
     # Re-apply our own status callback on the Twilio number itself — ElevenLabs'
     # import may have overwritten it. This is what lets send_missed_call_text
