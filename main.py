@@ -3144,7 +3144,7 @@ def sms_privacy(customer_id: str):
 from typing import Optional
 from pydantic import BaseModel
 
-CRM_STATUSES = ("new", "contacted", "qualified", "booked", "won", "lost", "do_not_contact")
+CRM_STATUSES = ("new", "contacted", "qualified", "quoted", "booked", "won", "lost", "do_not_contact")
 
 
 def _require_uuid(value: str, what: str = "Not found"):
@@ -3796,7 +3796,8 @@ async def run_followups(request: Request):
         return {"ok": False, "reason": "twilio not configured"}
 
     now = datetime.now(timezone.utc)
-    out = {"tasks_done": 0, "tasks_failed": 0, "tasks_waiting": 0, "auto_texts": 0, "auto_calls": 0, "auto_failed": 0}
+    out = {"tasks_done": 0, "tasks_failed": 0, "tasks_waiting": 0, "auto_texts": 0, "auto_calls": 0, "auto_failed": 0,
+           "stalled_texts": 0, "stalled_calls": 0, "stalled_failed": 0}
 
     # 1. Scheduled AI follow-ups
     due = (sb.table("recall_tasks").select("*, recall_contacts(*)")
@@ -3860,6 +3861,32 @@ async def run_followups(request: Request):
         except Exception as e:
             log.error(f"Auto follow-up for contact {r['contact_id']} failed: {getattr(e, 'detail', e)}")
             out["auto_failed"] += 1
+    # 3. Stalled lead recovery
+    try:
+        stalled = sb.rpc("recall_crm_due_stalled", {}).execute().data or []
+    except Exception as e:
+        log.error(f"Stalled-lead query failed: {e}")
+        stalled = []
+    for r in stalled[:25]:
+        cutoff = (now - timedelta(hours=1)).isoformat()
+        claimed = (sb.table("recall_contacts").update({
+            "stall_attempts": r["attempt"], "stall_last_at": now.isoformat(),
+        }).eq("id", r["contact_id"]).or_(f"stall_last_at.is.null,stall_last_at.lt.{cutoff}").execute()).data
+        if not claimed:
+            continue
+        contact = claimed[0]
+        try:
+            message = _stalled_message(r)
+            if r["channel"] == "call":
+                _place_crm_call(r["customer_id"], contact, "ai_message", message, kind="stalled_followup")
+                out["stalled_calls"] += 1
+            else:
+                _run_text(r["customer_id"], contact, message, "stalled_followup")
+                out["stalled_texts"] += 1
+        except Exception as e:
+            log.error(f"Stalled-lead follow-up for {r['contact_id']} failed: {getattr(e, 'detail', e)}")
+            out["stalled_failed"] += 1
+
     if any(out.values()):
         log.info(f"run-followups: {out}")
     return out
@@ -3924,3 +3951,209 @@ def save_followup_settings(customer_id: str, payload: FollowupSettings, location
     if upd:
         loc = sb.table(TABLE_LOC).update(upd).eq("id", loc["id"]).execute().data[0]
     return _followup_view(loc)
+
+
+
+# ===========================================================================
+# STALLED LEAD RECOVERY — leads that were Contacted / Qualified / Quoted and
+# then went quiet get a check-in written by the AI from what it remembers
+# about them ("Hi Bob, just checking in on the $800 brake quote…").
+# Attempt 1 = text, attempt 2 = AI call (if enabled), attempt 3 = last text.
+# Eligibility lives in recall_crm_due_stalled(); runs in /internal/run-followups.
+# ===========================================================================
+def _stalled_fallback(r: dict) -> str:
+    first = (r.get("name") or "").split(" ")[0]
+    hi = f"Hi {first}, " if first else "Hi, "
+    biz = r.get("business_name") or "us"
+    amt = f" for ${float(r['quote_amount']):,.0f}" if r.get("quote_amount") else ""
+    if r["channel"] == "call":
+        what = f"the quote we sent you{amt}" if r.get("status") == "quoted" else "your recent request"
+        return (f"We're following up on {what}. If you'd like to go ahead or have any questions, "
+                "press 1 now to talk with us, or call us back any time.")
+    if r.get("status") == "quoted":
+        return (f"{hi}this is {biz} checking in on the quote we sent{amt}. Any questions, or would you like "
+                "to get it on the schedule? Just reply here.")
+    if r.get("attempt", 1) >= 3:
+        return f"{hi}last check-in from {biz} — if you still need help, just reply here and we'll take care of you."
+    return f"{hi}this is {biz} following up. Still need help? Reply here and we'll get you taken care of."
+
+
+def _stalled_message(r: dict) -> str:
+    """Short, personal check-in written from the contact's memory; falls back to a template."""
+    fallback = _stalled_fallback(r)
+    if not ANTHROPIC_API_KEY:
+        return fallback
+    is_call = r["channel"] == "call"
+    try:
+        context = [f"Business: {r.get('business_name')}", f"Customer name: {r.get('name') or 'unknown'}",
+                   f"Lead status: {r.get('status')}", f"Days since last contact: {r.get('quiet_days')}",
+                   f"This is follow-up attempt {r.get('attempt')} (3 = final)."]
+        if r.get("quote_amount"):
+            context.append(f"Quote sent: ${float(r['quote_amount']):,.2f}" + (f" — {r['quote_note']}" if r.get("quote_note") else ""))
+        if r.get("memory"):
+            context.append("What we know about them:\n" + r["memory"])
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
+            json={
+                "model": ANTHROPIC_MODEL, "max_tokens": 200,
+                "system": (
+                    "You write one short follow-up for a small local business to a customer who went quiet. "
+                    + ("It will be READ ALOUD by an automated phone call right after the line 'Hi <name>, this is an "
+                       "automated call from <business>.', so don't greet them again; 1–3 short spoken sentences; end by "
+                       "saying they can press 1 to talk with someone now. "
+                       if is_call else
+                       "It is a text message: 1–2 sentences, under 280 characters, start with 'Hi <first name>,' when "
+                       "the name is known and say which business it is. ")
+                    + "Be warm and helpful, never pushy. Mention the specific thing they asked about or were quoted "
+                    "when it's known. Never invent prices, discounts, dates or facts that aren't in the context. "
+                    "Never mention health details. On a final attempt, make clear it's the last check-in. "
+                    "Output only the message."
+                ),
+                "messages": [{"role": "user", "content": "\n".join(context)}],
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        text = "".join(b.get("text", "") for b in resp.json().get("content", []) if b.get("type") == "text").strip().strip('"')
+        limit = 600 if is_call else 320
+        return text[:limit] if len(text) >= 20 else fallback
+    except Exception as e:
+        log.error(f"Stalled message generation failed, using template: {e}")
+        return fallback
+
+
+class QuoteCreate(BaseModel):
+    amount: float
+    note: Optional[str] = None
+
+
+@app.post("/crm/{customer_id}/contacts/{contact_id}/quote")
+def crm_quote(customer_id: str, contact_id: str, payload: QuoteCreate, background: BackgroundTasks,
+              authorization: str = Header(None)):
+    """Owner logs 'Quote sent: $X'. Moves the lead to Quoted (never backward from
+    Booked/Won) so stalled-lead recovery knows to chase it."""
+    require_auth(customer_id, authorization)
+    contact = _get_contact_or_404(customer_id, contact_id)
+    if payload.amount is None or payload.amount <= 0 or payload.amount > 10_000_000:
+        raise HTTPException(422, "Enter the quote amount.")
+    note = (payload.note or "").strip()[:300] or None
+    now = datetime.now(timezone.utc).isoformat()
+    sb.table("recall_contacts").update({
+        "quote_amount": round(float(payload.amount), 2), "quote_sent_at": now, "quote_note": note,
+        "last_activity_at": now, "stall_attempts": 0, "stall_last_at": None,
+    }).eq("id", contact_id).eq("customer_id", customer_id).execute()
+    body = f"Quote sent: ${payload.amount:,.2f}" + (f" — {note}" if note else "")
+    sb.table("recall_contact_activities").insert({
+        "contact_id": contact_id, "customer_id": customer_id, "type": "quote", "body": body,
+        "metadata": {"amount": round(float(payload.amount), 2)},
+    }).execute()
+    if contact.get("status") in ("new", "contacted", "qualified", "lost"):
+        sb.rpc("recall_crm_update_contact", {"p_customer_id": customer_id, "p_contact_id": contact_id,
+                                             "p_patch": {"status": "quoted"}}).execute()
+    background.add_task(update_contact_memory, customer_id, None, body + ".", "owner update", None, contact_id)
+    return _get_contact_or_404(customer_id, contact_id)
+
+
+class RecoverySettings(BaseModel):
+    enabled: Optional[bool] = None
+    after_days: Optional[int] = None
+    quote_after_days: Optional[int] = None
+    max_attempts: Optional[int] = None
+    call_enabled: Optional[bool] = None
+
+
+def _recovery_view(loc: dict) -> dict:
+    return {"location_id": loc["id"], "enabled": loc.get("stall_enabled", False),
+            "after_days": loc.get("stall_after_days", 3), "quote_after_days": loc.get("stall_quote_after_days", 2),
+            "max_attempts": loc.get("stall_max_attempts", 2), "call_enabled": loc.get("stall_call_enabled", True)}
+
+
+@app.get("/crm/{customer_id}/recovery-settings")
+def get_recovery_settings(customer_id: str, location_id: str = None, authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    return _recovery_view(get_location_for_customer(customer_id, location_id))
+
+
+@app.post("/crm/{customer_id}/recovery-settings")
+def save_recovery_settings(customer_id: str, payload: RecoverySettings, location_id: str = None,
+                           authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    loc = get_location_for_customer(customer_id, location_id)
+    f = payload.model_dump(exclude_unset=True) if hasattr(payload, "model_dump") else payload.dict(exclude_unset=True)
+    upd = {}
+    if "enabled" in f:
+        upd["stall_enabled"] = bool(f["enabled"])
+        if f["enabled"] and not loc.get("stall_enabled"):
+            upd["stall_enabled_at"] = datetime.now(timezone.utc).isoformat()
+    for k, col, lo, hi in (("after_days", "stall_after_days", 1, 30), ("quote_after_days", "stall_quote_after_days", 1, 30),
+                           ("max_attempts", "stall_max_attempts", 1, 3)):
+        if k in f:
+            v = int(f[k])
+            if not (lo <= v <= hi):
+                raise HTTPException(422, f"{k.replace('_', ' ').capitalize()} must be between {lo} and {hi}.")
+            upd[col] = v
+    if "call_enabled" in f:
+        upd["stall_call_enabled"] = bool(f["call_enabled"])
+    if upd:
+        loc = sb.table(TABLE_LOC).update(upd).eq("id", loc["id"]).execute().data[0]
+    return _recovery_view(loc)
+
+
+# ===========================================================================
+# ROI DASHBOARD
+# ===========================================================================
+def _roi_range(period: str):
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(BUSINESS_TZ)
+    now_local = datetime.now(tz)
+    end = (now_local + timedelta(minutes=1)).astimezone(timezone.utc)
+    if period == "this_month":
+        start = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    elif period == "last_month":
+        first = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        start = (first - timedelta(days=1)).replace(day=1)
+        end = first.astimezone(timezone.utc)
+    elif period == "90d":
+        start = now_local - timedelta(days=90)
+    elif period == "all":
+        start = now_local - timedelta(days=3650)
+    else:
+        start = now_local - timedelta(days=30)
+    return start.astimezone(timezone.utc), end
+
+
+@app.get("/crm/{customer_id}/roi")
+def crm_roi(customer_id: str, period: str = "30d", authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    if period not in ("30d", "this_month", "last_month", "90d", "all"):
+        raise HTTPException(422, "period must be 30d, this_month, last_month, 90d or all.")
+    start, end = _roi_range(period)
+    if period == "all":
+        cust = sb.table(TABLE_CUST).select("created_at").eq("id", customer_id).execute().data
+        if cust and cust[0].get("created_at"):
+            start = max(start, datetime.fromisoformat(cust[0]["created_at"].replace("Z", "+00:00")))
+    data = sb.rpc("recall_crm_roi", {"p_customer_id": customer_id, "p_from": start.isoformat(),
+                                     "p_to": end.isoformat()}).execute().data
+    return {**(data or {}), "period": period}
+
+
+class RoiSettings(BaseModel):
+    avg_job_value: Optional[float] = None
+    monthly_cost: Optional[float] = None
+
+
+@app.post("/crm/{customer_id}/roi-settings")
+def save_roi_settings(customer_id: str, payload: RoiSettings, authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    f = payload.model_dump(exclude_unset=True) if hasattr(payload, "model_dump") else payload.dict(exclude_unset=True)
+    upd = {}
+    for k in ("avg_job_value", "monthly_cost"):
+        if k in f:
+            v = f[k]
+            if v is not None and (v < 0 or v > 1_000_000):
+                raise HTTPException(422, "Enter a valid dollar amount.")
+            upd[k] = round(float(v), 2) if v is not None else None
+    if upd:
+        sb.table(TABLE_CUST).update(upd).eq("id", customer_id).execute()
+    return {"ok": True, **upd}
