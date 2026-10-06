@@ -13,6 +13,8 @@ ENV VARS REQUIRED (set these on Render):
 """
 import os
 import re
+import time
+import html
 import hmac
 import hashlib
 import secrets
@@ -22,13 +24,15 @@ from datetime import datetime, timezone, timedelta
 import jwt
 import requests
 from starlette.concurrency import run_in_threadpool
-from fastapi import FastAPI, Request, Form, HTTPException, Header, UploadFile, File, BackgroundTasks
+from fastapi import FastAPI, Request, Form, HTTPException, Header, UploadFile, File, BackgroundTasks, Depends
 from fastapi.responses import PlainTextResponse, JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from twilio.twiml.voice_response import VoiceResponse, Dial
 from twilio.rest import Client as TwilioClient
 from supabase import create_client, Client
 import stripe
+from typing import Optional
+from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("recall")
@@ -72,7 +76,7 @@ GOOGLE_SCOPES = {
 # The approved A2P 10DLC campaign's Messaging Service — new numbers get added
 # to this automatically so texts aren't blocked as unregistered.
 TWILIO_MESSAGING_SERVICE_SID = os.environ.get("TWILIO_MESSAGING_SERVICE_SID", "MGb2dbff5d0714aae51d6c9b5dc42114d0")
-PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://main-backend-k32m.onrender.com")
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://missed-call-recall.onrender.com")
 # The Netlify site where index.html / dashboard.html actually live. This is
 # what customers should land on after paying — the backend has no UI of its own.
 FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "https://callskept.com")
@@ -129,8 +133,30 @@ def verify_password(password: str, stored: str) -> bool:
 
 
 def make_token(customer_id: str) -> str:
-    payload = {"customer_id": customer_id, "exp": datetime.now(timezone.utc) + timedelta(days=30)}
+    now = datetime.now(timezone.utc)
+    payload = {"customer_id": customer_id, "typ": "session", "iat": int(now.timestamp()),
+               "exp": now + timedelta(days=30)}
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+
+def make_purpose_token(customer_id: str, typ: str, minutes: int, **extra) -> str:
+    """Single-purpose signed links (email verification, password reset). They
+    carry a typ that require_auth refuses, so they can never act as a login."""
+    payload = {"customer_id": customer_id, "typ": typ,
+               "exp": datetime.now(timezone.utc) + timedelta(minutes=minutes), **extra}
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+
+def read_purpose_token(token: str, typ: str) -> dict:
+    try:
+        payload = jwt.decode(token or "", JWT_SECRET, algorithms=["HS256"])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(400, "This link has expired — please request a new one.")
+    except jwt.InvalidTokenError:
+        raise HTTPException(400, "This link isn't valid.")
+    if payload.get("typ") != typ:
+        raise HTTPException(400, "This link isn't valid.")
+    return payload
 
 
 def require_auth(customer_id: str, authorization: str = Header(None)):
@@ -144,20 +170,176 @@ def require_auth(customer_id: str, authorization: str = Header(None)):
         raise HTTPException(401, "Session expired — please log in again.")
     except jwt.InvalidTokenError:
         raise HTTPException(401, "Invalid session.")
+    if payload.get("typ") not in (None, "session"):
+        raise HTTPException(401, "Invalid session.")
     if payload.get("customer_id") != customer_id:
         raise HTTPException(403, "Not authorized for this account.")
+    changed = _password_changed_ts(customer_id)
+    if changed and int(payload.get("iat") or 0) < changed - 2:
+        raise HTTPException(401, "Your password was changed — please log in again.")
+
+
+_PWD_CHANGED_CACHE: dict = {}
+
+
+def _password_changed_ts(customer_id: str) -> int:
+    """When this account's password last changed (cached 60s). Sessions issued
+    before that are signed out."""
+    hit = _PWD_CHANGED_CACHE.get(customer_id)
+    if hit and hit[1] > time.time():
+        return hit[0]
+    ts = 0
+    try:
+        rows = sb.table(TABLE_CUST).select("password_changed_at").eq("id", customer_id).limit(1).execute().data
+        if rows and rows[0].get("password_changed_at"):
+            ts = int(datetime.fromisoformat(str(rows[0]["password_changed_at"]).replace("Z", "+00:00")).timestamp())
+    except Exception as e:
+        log.warning(f"Couldn't check password change time for {customer_id}: {e}")
+        return hit[0] if hit else 0  # don't cache a failed lookup
+    _PWD_CHANGED_CACHE[customer_id] = (ts, time.time() + 60)
+    return ts
+
+
+def _derived_secret(name: str) -> str:
+    """Stable fallback for an unset internal secret: derived from JWT_SECRET so
+    it survives restarts (a random per-restart value silently broke things)."""
+    return hmac.new(JWT_SECRET.encode(), f"callskept:{name}".encode(), hashlib.sha256).hexdigest()
+
+
+def secret_ok(given, expected) -> bool:
+    return bool(expected) and hmac.compare_digest(str(given or ""), str(expected))
 
 
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET")
 if not ADMIN_SECRET:
-    ADMIN_SECRET = secrets.token_hex(24)
-    log.warning("ADMIN_SECRET not set — using a random per-restart value. Set it in Render.")
+    ADMIN_SECRET = _derived_secret("admin")
+    log.warning("ADMIN_SECRET not set — using a value derived from JWT_SECRET. Set it in Render.")
 
 
 def require_admin(authorization: str = Header(None)):
     """For Saleh-only internal endpoints — not tied to any customer account."""
-    if not authorization or authorization.removeprefix("Bearer ").strip() != ADMIN_SECRET:
+    if not authorization or not secret_ok(authorization.removeprefix("Bearer ").strip(), ADMIN_SECRET):
         raise HTTPException(401, "Not authorized.")
+
+
+# ---------------------------------------------------------------------------
+# LAUNCH HARDENING — app settings, rate limits, Twilio signature checks,
+# account-status gating and send caps.
+# ---------------------------------------------------------------------------
+_settings_cache = {"at": 0.0, "values": {}}
+
+
+def app_setting(key: str, default=None):
+    """Small runtime switches kept in recall_app_settings (no redeploy needed)."""
+    import time
+    if time.time() - _settings_cache["at"] > 60:
+        try:
+            rows = sb.table("recall_app_settings").select("key, value").execute().data or []
+            _settings_cache["values"] = {r["key"]: r["value"] for r in rows}
+        except Exception as e:
+            log.error(f"Couldn't load app settings: {e}")
+        _settings_cache["at"] = time.time()
+    val = _settings_cache["values"].get(key)
+    return default if val is None else val
+
+
+_rate_buckets: dict = {}
+
+
+def client_ip(request: Request) -> str:
+    # Render sits behind Cloudflare, which overwrites CF-Connecting-IP / True-Client-IP,
+    # so those can't be forged. X-Forwarded-For's first entry can, so only the
+    # right-most hop (added by the proxy) is used as a fallback.
+    for h in ("cf-connecting-ip", "true-client-ip"):
+        v = (request.headers.get(h) or "").strip()
+        if v:
+            return v
+    fwd = [x.strip() for x in (request.headers.get("x-forwarded-for") or "").split(",") if x.strip()]
+    return (fwd[-1] if fwd else (request.client.host if request.client else "")) or "unknown"
+
+
+def rate_limit(bucket: str, key: str, limit: int, window_secs: int, message: str = None):
+    """In-memory sliding-window limiter (single Render instance). Raises 429."""
+    import time
+    now = time.time()
+    k = (bucket, (key or "").lower())
+    hits = [t for t in _rate_buckets.get(k, []) if now - t < window_secs]
+    if len(hits) >= limit:
+        _rate_buckets[k] = hits
+        raise HTTPException(429, message or "Too many attempts — please wait a few minutes and try again.")
+    hits.append(now)
+    _rate_buckets[k] = hits
+    if len(_rate_buckets) > 50000:  # keep memory bounded
+        for old in list(_rate_buckets)[:10000]:
+            _rate_buckets.pop(old, None)
+
+
+async def verify_twilio(request: Request):
+    """Rejects webhook calls that weren't signed by our Twilio account, so
+    nobody can fake a missed call / text and make us send messages."""
+    mode = app_setting("twilio_signature_check", "enforce")
+    if mode == "off" or not TWILIO_TOKEN:
+        return
+    from twilio.request_validator import RequestValidator
+    sig = request.headers.get("x-twilio-signature", "")
+    form = await request.form()
+    params = {k: v for k, v in form.multi_items()}
+    q = ("?" + request.url.query) if request.url.query else ""
+    candidates = {PUBLIC_BASE_URL.rstrip("/") + request.url.path + q}
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+    if host:
+        candidates.add(f"https://{host}{request.url.path}{q}")
+    validator = RequestValidator(TWILIO_TOKEN)
+    if sig and any(validator.validate(u, params, sig) for u in candidates):
+        return
+    log.warning(f"Twilio signature check failed for {request.url.path} (mode={mode})")
+    if mode == "enforce":
+        raise HTTPException(403, "Invalid signature.")
+
+
+ACTIVE_STATUSES = ("trial", "active")
+
+
+def customer_status(customer_id: str) -> str:
+    r = sb.table(TABLE_CUST).select("status").eq("id", customer_id).limit(1).execute().data
+    return (r[0].get("status") if r else None) or "canceled"
+
+
+def require_active(customer_id: str):
+    st = customer_status(customer_id)
+    if st == "pending_payment":
+        raise HTTPException(402, "Finish checkout to start your trial — open Plans & billing.")
+    if st not in ACTIVE_STATUSES:
+        raise HTTPException(402, "Your subscription isn't active — update billing in Plans & billing to keep using CallsKept.")
+
+
+def sends_today(customer_id: str, activity_type: str) -> int:
+    from zoneinfo import ZoneInfo
+    start = datetime.now(ZoneInfo("America/New_York")).replace(hour=0, minute=0, second=0, microsecond=0)
+    try:
+        r = (sb.table("recall_contact_activities").select("id", count="exact")
+             .eq("customer_id", customer_id).eq("type", activity_type)
+             .gte("created_at", start.astimezone(timezone.utc).isoformat()).limit(1).execute())
+        return r.count or 0
+    except Exception as e:
+        log.error(f"Send-cap count failed for {customer_id}: {e}")
+        return 0
+
+
+def is_us_number(e164: str) -> bool:
+    return bool(re.fullmatch(r"\+1[2-9]\d{2}[2-9]\d{6}", e164 or ""))
+
+
+PDF_MAX_BYTES = 5 * 1024 * 1024
+
+
+async def _read_pdf_upload(pdf) -> bytes:
+    data = await pdf.read(PDF_MAX_BYTES + 1)
+    if len(data) > PDF_MAX_BYTES:
+        raise HTTPException(413, "That PDF is larger than 5 MB — please upload a smaller file.")
+    if not data.startswith(b"%PDF"):
+        raise HTTPException(415, "That file isn't a PDF.")
+    return data
 
 
 def require_twilio():
@@ -181,9 +363,12 @@ def el_headers():
 app = FastAPI(title="CallsKept - Missed Call Recovery")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten to your Netlify domain once live
-    allow_methods=["*"],
-    allow_headers=["*"],
+    # Only CallsKept's own site (and its Netlify previews) may call the API from a browser.
+    allow_origins=["https://callskept.com", "https://www.callskept.com",
+                   "https://glowing-hotteok-00a881.netlify.app"],
+    allow_origin_regex=r"https://[a-z0-9-]+--glowing-hotteok-00a881\.netlify\.app",
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 TABLE_CUST = "recall_customers"
@@ -309,6 +494,16 @@ def send_customer_sms(customer_id: str, to: str, from_: str, body: str,
     then sends via Twilio and logs an sms_out activity.
     Returns the Twilio message SID, or None if blocked.
     Raises on Twilio errors so callers keep their existing error handling."""
+    if not is_us_number(normalize_e164(to or "")):
+        log.info(f"Skipped {kind} text to non-US/invalid number (customer {customer_id})")
+        return None
+    st = customer_status(customer_id)
+    if st not in ACTIVE_STATUSES:
+        log.info(f"Skipped {kind} text — account {customer_id} is {st}")
+        return None
+    if sends_today(customer_id, "sms_out") >= int(app_setting("daily_sms_cap", 300)):
+        log.warning(f"Daily text cap reached for customer {customer_id} — {kind} text not sent")
+        return None
     try:
         allowed = sb.rpc("recall_crm_can_text", {
             "p_customer_id": customer_id, "p_phone": to, "p_body": body, "p_reason": kind,
@@ -664,6 +859,7 @@ async def add_location(
     authorization: str = Header(None),
 ):
     require_auth(customer_id, authorization)
+    business_phone = normalize_us_phone(business_phone)  # US numbers only (blocks premium/intl toll fraud)
     require_twilio()
 
     cust = sb.table(TABLE_CUST).select("id, business_name, tier, status").eq("id", customer_id).execute()
@@ -672,56 +868,27 @@ async def add_location(
     customer = cust.data[0]
     if customer["status"] not in ("trial", "active"):
         raise HTTPException(403, "This account's subscription isn't active — can't add a location right now.")
+    existing_locs = sb.table(TABLE_LOC).select("id", count="exact").eq("customer_id", customer_id).limit(1).execute()
+    if (existing_locs.count or 0) >= 10:
+        raise HTTPException(403, "This account already has 10 locations — contact support@callskept.com to add more.")
 
-    # Same warmed-pool-first logic as signup, so a new location doesn't get
-    # hit with A2P propagation delay on top of everything else.
-    pooled = get_warmed_number()
-    if pooled:
-        class _Purchased:
-            phone_number = pooled["phone_number"]
-            sid = pooled["twilio_sid"]
-        purchased = _Purchased()
-    else:
-        log.warning(f"Number pool empty — buying a fresh number for a new location on account {customer_id}.")
-        search_kwargs = {"limit": 1}
-        if area_code:
-            search_kwargs["area_code"] = area_code
-        numbers = twilio_client.available_phone_numbers("US").local.list(**search_kwargs)
-        if not numbers:
-            numbers = twilio_client.available_phone_numbers("US").local.list(limit=1)
-        if not numbers:
-            raise HTTPException(500, "No Twilio numbers available right now — try again shortly.")
-        purchased = twilio_client.incoming_phone_numbers.create(
-            phone_number=numbers[0].phone_number,
-            voice_url=f"{PUBLIC_BASE_URL}/twilio/voice",
-            voice_method="POST",
-            status_callback=f"{PUBLIC_BASE_URL}/twilio/status",
-            status_callback_method="POST",
-            sms_url=f"{PUBLIC_BASE_URL}/twilio/sms",
-            sms_method="POST",
-        )
-        if TWILIO_MESSAGING_SERVICE_SID:
-            try:
-                twilio_client.messaging.v1.services(TWILIO_MESSAGING_SERVICE_SID).phone_numbers.create(
-                    phone_number_sid=purchased.sid
-                )
-            except Exception as e:
-                log.error(f"Failed to add {purchased.phone_number} to A2P sender pool: {e}")
+    # Same warmed-pool-first logic as signup (pool numbers are claimed
+    # atomically, so two requests can't be handed the same one).
+    number, _sid, pool_id = acquire_number(area_code)
 
+    class _Purchased:
+        phone_number = number
+    purchased = _Purchased()
     loc_row = {
         "customer_id": customer_id,
-        "location_label": location_label.strip() or "New location",
+        "location_label": (location_label.strip() or "New location")[:80],
         "business_phone": business_phone,
-        "twilio_number": purchased.phone_number,
+        "twilio_number": number,
     }
     result = sb.table(TABLE_LOC).insert(loc_row).execute()
     location = result.data[0]
-
-    if pooled:
-        sb.table("recall_number_pool").update({
-            "assigned_to_customer_id": customer_id,
-            "assigned_at": datetime.now(timezone.utc).isoformat(),
-        }).eq("id", pooled["id"]).execute()
+    if pool_id:
+        sb.table("recall_number_pool").update({"assigned_to_customer_id": customer_id}).eq("id", pool_id).execute()
 
     return {
         "location_id": location["id"],
@@ -746,6 +913,7 @@ def update_location(
     place you create a location is the same place you can fix its name or
     forwarding number later, no separate admin screen needed."""
     require_auth(customer_id, authorization)
+    business_phone = normalize_us_phone(business_phone)  # US numbers only (blocks premium/intl toll fraud)
     loc = sb.table(TABLE_LOC).select("id, customer_id").eq("id", location_id).execute()
     if not loc.data or loc.data[0]["customer_id"] != customer_id:
         raise HTTPException(404, "Location not found for this account.")
@@ -814,146 +982,894 @@ def delete_location(location_id: str, customer_id: str = Form(...), permanent: b
     }
 
 
+PLAN_PRICES = {"basic": 35, "pro": 129, "elite": 199}
+PLAN_NAMES = {"basic": "Basic", "pro": "Pro", "elite": "Elite"}
+PLAN_RANK = {"basic": 0, "pro": 1, "elite": 2}
+
+
+def price_for_tier(tier: str) -> str:
+    return {"basic": STRIPE_PRICE_ID, "pro": STRIPE_PRICE_ID_PRO,
+            "elite": STRIPE_PRICE_ID_ELITE}.get(tier)
+
+
+def tier_for_price(price_id: str) -> Optional[str]:
+    # Elite first: if Elite has no price of its own it shares Pro's, and the
+    # subscription itself can't tell us which one they chose.
+    if price_id and price_id == STRIPE_PRICE_ID_ELITE:
+        return "elite"
+    if price_id and price_id == STRIPE_PRICE_ID_PRO:
+        return "pro"
+    if price_id and price_id == STRIPE_PRICE_ID:
+        return "basic"
+    return None
+
+
+def acquire_number(area_code: str = None):
+    """A warmed pool number if one is free (claimed atomically so two signups
+    can't get the same one), else a freshly bought number registered to our
+    texting campaign. Returns (phone_number, twilio_sid, pool_row_id or None)."""
+    for _ in range(3):
+        pooled = get_warmed_number()
+        if not pooled:
+            break
+        claimed = (sb.table("recall_number_pool").update({"assigned_at": datetime.now(timezone.utc).isoformat()})
+                   .eq("id", pooled["id"]).is_("assigned_at", "null").execute()).data
+        if claimed:
+            return pooled["phone_number"], pooled.get("twilio_sid"), pooled["id"]
+    log.warning("Number pool empty — buying a fresh number; texts may be delayed by A2P propagation.")
+    search_kwargs = {"limit": 1}
+    if area_code and re.fullmatch(r"[2-9]\d\d", area_code):
+        search_kwargs["area_code"] = area_code
+    numbers = twilio_client.available_phone_numbers("US").local.list(**search_kwargs)
+    if not numbers:
+        numbers = twilio_client.available_phone_numbers("US").local.list(limit=1)
+    if not numbers:
+        raise HTTPException(503, "No phone numbers are available right now — please try again shortly.")
+    purchased = twilio_client.incoming_phone_numbers.create(
+        phone_number=numbers[0].phone_number,
+        voice_url=f"{PUBLIC_BASE_URL}/twilio/voice", voice_method="POST",
+        status_callback=f"{PUBLIC_BASE_URL}/twilio/status", status_callback_method="POST",
+        sms_url=f"{PUBLIC_BASE_URL}/twilio/sms", sms_method="POST",
+    )
+    if TWILIO_MESSAGING_SERVICE_SID:
+        try:
+            twilio_client.messaging.v1.services(TWILIO_MESSAGING_SERVICE_SID).phone_numbers.create(
+                phone_number_sid=purchased.sid)
+        except Exception as e:
+            log.error(f"Failed to add {purchased.phone_number} to A2P sender pool: {e}")
+    return purchased.phone_number, purchased.sid, None
+
+
+def _new_checkout_session(customer: dict) -> str:
+    price_id = price_for_tier(customer["tier"])
+    if not price_id:
+        raise HTTPException(503, "This plan isn't available right now — please pick another plan or contact support@callskept.com.")
+    stripe_customer_id = customer.get("stripe_customer_id")
+    if not stripe_customer_id:
+        stripe_customer_id = stripe.Customer.create(
+            email=customer["email"], name=customer.get("business_name"),
+            metadata={"customer_id": customer["id"]}).id
+        sb.table(TABLE_CUST).update({"stripe_customer_id": stripe_customer_id}).eq("id", customer["id"]).execute()
+    old_session = customer.get("checkout_session_id")
+    if old_session:
+        try:
+            stripe.checkout.Session.expire(old_session)  # so an older tab can't start a 2nd subscription
+        except Exception:
+            pass  # already completed or expired
+    sub_data = {"metadata": {"customer_id": customer["id"]}}
+    if not (customer.get("trial_used_at") or customer.get("welcome_sent_at")):
+        sub_data["trial_period_days"] = 7  # one free trial per account, not per restart
+    checkout = stripe.checkout.Session.create(
+        customer=stripe_customer_id,
+        mode="subscription",
+        line_items=[{"price": price_id, "quantity": 1}],
+        subscription_data=sub_data,
+        allow_promotion_codes=True,
+        success_url=f"{FRONTEND_BASE_URL}/dashboard.html?customer_id={customer['id']}&checkout=success&session_id={{CHECKOUT_SESSION_ID}}",
+        cancel_url=f"{FRONTEND_BASE_URL}/plans.html?customer_id={customer['id']}&checkout=canceled",
+        metadata={"customer_id": customer["id"]},
+    )
+    sb.table(TABLE_CUST).update({"checkout_session_id": checkout.id}).eq("id", customer["id"]).execute()
+    return checkout.url
+
+
 # ---------------------------------------------------------------------------
-# SIGNUP — creates the ACCOUNT (email/password/Stripe/tier) plus its first
-# location (Twilio number + business phone). This is the only place email
-# uniqueness is enforced — every location added after this goes through
-# /locations/add instead, which never touches email at all.
+# SIGNUP — creates the account and its first location, then sends the person
+# to Stripe Checkout. Nothing that costs money (a phone number) is handed out
+# until checkout succeeds — see finalize_account(). The account sits in
+# status "pending_payment" until then and can't send texts or calls.
 # ---------------------------------------------------------------------------
 @app.post("/signup")
-async def signup(
+def signup(
+    request: Request,
     business_name: str = Form(...),
     owner_name: str = Form(...),
     email: str = Form(...),
     password: str = Form(...),
-    business_phone: str = Form(...),  # their real phone, in E.164 e.g. +13155551234
-    tier: str = Form("basic"),        # "basic", "pro", or "elite"
-    area_code: str = Form(None),      # optional preferred area code for the new number
-    reply_template: str = Form(None), # optional custom auto-reply text
+    business_phone: str = Form(...),
+    tier: str = Form("basic"),
+    area_code: str = Form(None),
+    reply_template: str = Form(None),
+    accept_terms: str = Form(None),
 ):
     require_twilio()
     require_stripe()
-    if tier not in ("basic", "pro", "elite"):
-        raise HTTPException(400, "tier must be 'basic', 'pro', or 'elite'.")
-    price_id = {"basic": STRIPE_PRICE_ID, "pro": STRIPE_PRICE_ID_PRO,
-                "elite": STRIPE_PRICE_ID_ELITE or STRIPE_PRICE_ID_PRO}[tier]
-    if not price_id:
-        log.error(f"Signup blocked: no Stripe price configured for the {tier} plan")
-        raise HTTPException(503, "This plan isn't available right now — please try another plan or contact support@callskept.com.")
-    if len(password) < 8:
+    rate_limit("signup-ip", client_ip(request), 5, 60 * 60,
+               "Too many sign-ups from this connection — please try again in an hour.")
+    email = (email or "").strip().lower()
+    business_name = (business_name or "").strip()[:120]
+    owner_name = (owner_name or "").strip()[:120]
+    if tier not in PLAN_PRICES:
+        raise HTTPException(400, "Please choose Basic, Pro or Elite.")
+    if not re.fullmatch(r"[^@\s]{1,64}@[^@\s]{1,190}\.[a-z]{2,24}", email):
+        raise HTTPException(400, "Please enter a valid email address.")
+    if not business_name or not owner_name:
+        raise HTTPException(400, "Please enter your name and your business name.")
+    if len(password) < 8 or len(password) > 200:
         raise HTTPException(400, "Password must be at least 8 characters.")
-    existing = sb.table(TABLE_CUST).select("id").eq("email", email).execute()
-    if existing.data:
-        raise HTTPException(400, "An account with this email already exists.")
+    if (accept_terms or "").lower() not in ("on", "true", "1", "yes"):
+        raise HTTPException(400, "Please agree to the Terms of Service and Privacy Policy to continue.")
+    business_phone = normalize_us_phone(business_phone)
+    if not price_for_tier(tier):
+        log.error(f"Signup blocked: no Stripe price configured for the {tier} plan")
+        raise HTTPException(503, "This plan isn't available right now — please pick another plan or contact support@callskept.com.")
+    if sb.table(TABLE_CUST).select("id").eq("email", email).limit(1).execute().data:
+        raise HTTPException(400, "An account with this email already exists — log in instead, or reset your password.")
 
-    # 1. Get a phone number — prefer an already-warmed one from the pool
-    # (fully registered, no A2P propagation delay) over buying fresh.
-    pooled = get_warmed_number()
-    if pooled:
-        class _Purchased:  # shim so the rest of the function can treat this like a fresh purchase
-            phone_number = pooled["phone_number"]
-            sid = pooled["twilio_sid"]
-        purchased = _Purchased()
-    else:
-        log.warning(f"Number pool empty — buying a fresh number for {email}; texts may be delayed by A2P propagation.")
-        search_kwargs = {"limit": 1}
-        if area_code:
-            search_kwargs["area_code"] = area_code
-        numbers = twilio_client.available_phone_numbers("US").local.list(**search_kwargs)
-        if not numbers:
-            numbers = twilio_client.available_phone_numbers("US").local.list(limit=1)
-        if not numbers:
-            raise HTTPException(500, "No Twilio numbers available right now — try again shortly.")
-
-        purchased = twilio_client.incoming_phone_numbers.create(
-            phone_number=numbers[0].phone_number,
-            voice_url=f"{PUBLIC_BASE_URL}/twilio/voice",
-            voice_method="POST",
-            status_callback=f"{PUBLIC_BASE_URL}/twilio/status",
-            status_callback_method="POST",
-            sms_url=f"{PUBLIC_BASE_URL}/twilio/sms",
-            sms_method="POST",
-        )
-        # Register this number under the approved A2P 10DLC campaign so texts
-        # from it aren't silently blocked by US carriers (error 30034) — though
-        # since it's fresh, it still needs real propagation time regardless.
-        if TWILIO_MESSAGING_SERVICE_SID:
-            try:
-                twilio_client.messaging.v1.services(TWILIO_MESSAGING_SERVICE_SID).phone_numbers.create(
-                    phone_number_sid=purchased.sid
-                )
-            except Exception as e:
-                log.error(f"Failed to add {purchased.phone_number} to A2P sender pool: {e}")
-
-    # 2. Create the account row (status=trial) — account-level fields only.
-    row = {
-        "business_name": business_name,
-        "owner_name": owner_name,
-        "email": email,
-        "password_hash": hash_password(password),
-        "tier": tier,
-    }
-    result = sb.table(TABLE_CUST).insert(row).execute()
-    customer = result.data[0]
-
-    # 2b. Create its first location row — this is where the number/config lives.
-    loc_row = {
-        "customer_id": customer["id"],
-        "location_label": "Main location",
-        "business_phone": business_phone,
-        "twilio_number": purchased.phone_number,
-    }
+    now = datetime.now(timezone.utc).isoformat()
+    customer = sb.table(TABLE_CUST).insert({
+        "business_name": business_name, "owner_name": owner_name, "email": email,
+        "password_hash": hash_password(password), "tier": tier, "status": "pending_payment",
+        "terms_accepted_at": now, "password_changed_at": now,
+    }).execute().data[0]
+    loc_row = {"customer_id": customer["id"], "location_label": "Main location", "business_phone": business_phone}
+    if area_code and re.fullmatch(r"[2-9]\d\d", area_code.strip()):
+        loc_row["preferred_area_code"] = area_code.strip()
     if reply_template and reply_template.strip():
-        loc_row["reply_template"] = reply_template.strip()
-    loc_result = sb.table(TABLE_LOC).insert(loc_row).execute()
-    location = loc_result.data[0]
+        loc_row["reply_template"] = reply_template.strip()[:480]
+    location = sb.table(TABLE_LOC).insert(loc_row).execute().data[0]
 
-    if pooled:
-        sb.table("recall_number_pool").update({
-            "assigned_to_customer_id": customer["id"],
-            "assigned_at": datetime.now(timezone.utc).isoformat(),
-        }).eq("id", pooled["id"]).execute()
+    try:
+        checkout_url = _new_checkout_session(customer)
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"Checkout creation failed for new account {customer['id']}: {e}")
+        raise HTTPException(502, "Your account was created, but checkout didn't open. Log in to finish checkout.")
 
-    # 3. Create Stripe customer + Checkout session (card required, 7-day trial)
-    stripe_customer = stripe.Customer.create(email=email, name=business_name)
-    checkout = stripe.checkout.Session.create(
-        customer=stripe_customer.id,
-        mode="subscription",
-        line_items=[{"price": price_id, "quantity": 1}],
-        subscription_data={"trial_period_days": 7, "metadata": {"customer_id": customer["id"]}},
-        success_url=f"{FRONTEND_BASE_URL}/dashboard.html?customer_id={customer['id']}",
-        cancel_url=f"{FRONTEND_BASE_URL}/index.html",
-        metadata={"customer_id": customer["id"]},
-    )
-
-    sb.table(TABLE_CUST).update({"stripe_customer_id": stripe_customer.id}).eq(
-        "id", customer["id"]
-    ).execute()
+    try:
+        send_verification_email(customer)
+    except Exception as e:
+        log.error(f"Verification email failed for {customer['id']}: {e}")
 
     return {
         "customer_id": customer["id"],
         "location_id": location["id"],
         "token": make_token(customer["id"]),
-        "twilio_number_assigned": purchased.phone_number,
-        "checkout_url": checkout.url,
-        "instructions": (
-            f"Forward your business line ({business_phone}) to {purchased.phone_number} "
-            "when unanswered/busy (conditional call forwarding), or route calls directly "
-            "to it if you don't have an existing number."
-        ),
+        "checkout_url": checkout_url,
     }
+
+
+def _assign_primary_number(customer: dict) -> Optional[str]:
+    """Gives the main location a number if it doesn't have one yet. A 'claiming'
+    marker on the row makes sure two simultaneous calls can't both buy one."""
+    loc = get_primary_location(customer["id"])
+    if loc.get("twilio_number") and loc["twilio_number"] != "claiming":
+        return loc["twilio_number"]
+    claimed = (sb.table(TABLE_LOC).update({"twilio_number": "claiming"}).eq("id", loc["id"])
+               .is_("twilio_number", "null").execute()).data
+    if not claimed:
+        return None  # another request is assigning it right now
+    try:
+        number, sid, pool_id = acquire_number(loc.get("preferred_area_code"))
+    except Exception as e:
+        sb.table(TABLE_LOC).update({"twilio_number": None}).eq("id", loc["id"]).execute()
+        log.error(f"Number assignment failed for {customer['id']}: {e}")
+        alert_platform_owner(f"⚠️ CallsKept: {customer.get('business_name')} paid but didn't get a phone number yet "
+                             f"(it retries automatically) — {str(e)[:120]}")
+        return None
+    sb.table(TABLE_LOC).update({"twilio_number": number}).eq("id", loc["id"]).execute()
+    if pool_id:
+        sb.table("recall_number_pool").update({"assigned_to_customer_id": customer["id"]}).eq("id", pool_id).execute()
+    return number
+
+
+def finalize_account(customer_id: str, subscription_id: str = None) -> dict:
+    """Runs once checkout succeeds (from the Stripe webhook or the dashboard's
+    confirm call — whichever lands first). Starts the trial, gives the main
+    location its CallsKept number, and sends the welcome. Safe to call twice,
+    and a later call finishes anything an earlier one couldn't."""
+    now = datetime.now(timezone.utc).isoformat()
+    claimed = (sb.table(TABLE_CUST).update({
+        "status": "trial", "stripe_subscription_id": subscription_id, "checkout_session_id": None, "updated_at": now,
+    }).eq("id", customer_id).eq("status", "pending_payment").execute()).data
+    if not claimed:
+        c = (sb.table(TABLE_CUST).select("*").eq("id", customer_id).limit(1).execute().data or [None])[0]
+        if not c:
+            return {"finalized": False}
+        if subscription_id and not c.get("stripe_subscription_id"):
+            sb.table(TABLE_CUST).update({"stripe_subscription_id": subscription_id}).eq("id", customer_id).execute()
+        elif subscription_id and c.get("stripe_subscription_id") != subscription_id and c["status"] in ACTIVE_STATUSES:
+            # A second checkout tab was completed: don't bill them twice.
+            try:
+                stripe.Subscription.cancel(subscription_id, prorate=True)
+                log.warning(f"Canceled duplicate subscription {subscription_id} for {customer_id}")
+                alert_platform_owner(f"CallsKept: canceled a duplicate subscription for {c.get('business_name')} — "
+                                     "check Stripe in case a refund is needed.")
+            except Exception as e:
+                log.error(f"Couldn't cancel duplicate subscription {subscription_id}: {e}")
+        # Finish setup if an earlier attempt stopped half-way (e.g. number purchase failed)
+        if c["status"] in ACTIVE_STATUSES and not c.get("welcome_sent_at"):
+            number = _assign_primary_number(c)
+            if number:
+                send_welcome(c, number, get_primary_location(customer_id).get("business_phone"))
+            return {"finalized": True, "twilio_number": number, "recovered": True}
+        return {"finalized": False}
+    customer = claimed[0]
+    if not customer.get("trial_used_at"):
+        sb.table(TABLE_CUST).update({"trial_used_at": now}).eq("id", customer_id).execute()
+    if subscription_id:
+        try:
+            sub = stripe.Subscription.retrieve(subscription_id)
+            _sync_subscription(customer_id, sub)
+        except Exception as e:
+            log.error(f"Couldn't read subscription {subscription_id}: {e}")
+    number = _assign_primary_number(customer)
+    if customer.get("tier") in ("pro", "elite"):
+        apply_tier_change(customer_id, None, customer["tier"])  # restarting Pro/Elite → voice back on
+    if number and not customer.get("welcome_sent_at"):
+        send_welcome(customer, number, get_primary_location(customer_id).get("business_phone"))
+    first_time = not customer.get("welcome_sent_at")
+    alert_platform_owner(f"{'🎉 New CallsKept sign-up' if first_time else '🔁 CallsKept restart'}: {customer.get('business_name')} "
+                         f"({PLAN_NAMES.get(customer.get('tier'), '')}) — {customer.get('email')}")
+    return {"finalized": True, "twilio_number": number}
+
+
+def _sync_subscription(customer_id: str, sub) -> dict:
+    """Copies Stripe's view of the subscription onto the account: plan, status,
+    trial end, renewal date, and whether it's set to cancel."""
+    status_map = {"trialing": "trial", "active": "active", "past_due": "past_due", "unpaid": "past_due",
+                  "canceled": "canceled", "incomplete_expired": "canceled", "paused": "paused"}
+    upd = {"cancel_at_period_end": bool(sub.get("cancel_at_period_end")),
+           "updated_at": datetime.now(timezone.utc).isoformat()}
+    st = status_map.get(sub.get("status"))
+    if st:
+        upd["status"] = st
+    if sub.get("trial_end"):
+        upd["trial_ends_at"] = datetime.fromtimestamp(sub["trial_end"], timezone.utc).isoformat()
+    items = ((sub.get("items") or {}).get("data") or [])
+    period_end = sub.get("current_period_end") or (items[0].get("current_period_end") if items else None)
+    if period_end:
+        upd["current_period_end"] = datetime.fromtimestamp(period_end, timezone.utc).isoformat()
+    price_id = ((items[0].get("price") or {}).get("id")) if items else None
+    new_tier = tier_for_price(price_id)
+    before = (sb.table(TABLE_CUST).select("tier, status").eq("id", customer_id).execute().data or [{}])[0]
+    if new_tier and not (new_tier == "pro" and before.get("tier") == "elite" and price_id == STRIPE_PRICE_ID_PRO
+                         and not STRIPE_PRICE_ID_ELITE):
+        upd["tier"] = new_tier
+    sb.table(TABLE_CUST).update(upd).eq("id", customer_id).execute()
+    off = ("canceled", "past_due", "paused")
+    was_off, now_off = before.get("status") in off, upd.get("status", before.get("status")) in off
+    tier = upd.get("tier") or before.get("tier")
+    if now_off and not was_off:
+        apply_tier_change(customer_id, before.get("tier"), tier, canceled=True)  # stop AI voice usage
+    elif was_off and not now_off and before.get("status") != "pending_payment":
+        apply_tier_change(customer_id, None, tier)  # paid again → voice back on
+    elif not now_off and upd.get("tier") and upd["tier"] != before.get("tier"):
+        apply_tier_change(customer_id, before.get("tier"), upd["tier"])
+    return upd
+
+
+def apply_tier_change(customer_id: str, old_tier: str, new_tier: str, canceled: bool = False):
+    """Turns the AI voice off when an account drops to Basic (or cancels) and
+    back on when it upgrades, and re-saves agents so Elite-only tools match."""
+    customer = (sb.table(TABLE_CUST).select("*").eq("id", customer_id).execute().data or [None])[0]
+    if not customer:
+        return
+    locations = sb.table(TABLE_LOC).select("*").eq("customer_id", customer_id).execute().data or []
+    voice_on = new_tier in ("pro", "elite") and not canceled
+    for loc in locations:
+        try:
+            if not voice_on and loc.get("elevenlabs_phone_id"):
+                _detach_voice(loc)
+            elif voice_on and loc.get("elevenlabs_agent_id") and loc.get("twilio_number") and ELEVENLABS_API_KEY:
+                cust = {**customer, "tier": new_tier}
+                _resave_agent_for_location(cust, loc)
+                phone_id = _ensure_el_phone_assigned(cust, loc, loc["elevenlabs_agent_id"], loc.get("elevenlabs_phone_id"))
+                if phone_id != loc.get("elevenlabs_phone_id"):
+                    sb.table(TABLE_LOC).update({"elevenlabs_phone_id": phone_id}).eq("id", loc["id"]).execute()
+        except Exception as e:
+            log.error(f"Tier change {old_tier}->{new_tier} for location {loc.get('id')} failed: {e}")
+
+
+def _detach_voice(loc: dict):
+    """Unhooks the AI voice from a number: removes it from ElevenLabs and points
+    Twilio back at our own call handling (ring the owner, then text back)."""
+    phone_id = loc.get("elevenlabs_phone_id")
+    if phone_id and ELEVENLABS_API_KEY:
+        r = requests.delete(f"{ELEVENLABS_BASE}/convai/phone-numbers/{phone_id}", headers=el_headers(), timeout=30)
+        if not r.ok and r.status_code != 404:
+            log.error(f"Couldn't remove number from ElevenLabs ({phone_id}): {r.status_code} {r.text[:200]}")
+    if twilio_client and loc.get("twilio_number"):
+        nums = twilio_client.incoming_phone_numbers.list(phone_number=loc["twilio_number"], limit=1)
+        if nums:
+            nums[0].update(voice_url=f"{PUBLIC_BASE_URL}/twilio/voice", voice_method="POST",
+                           status_callback=f"{PUBLIC_BASE_URL}/twilio/status", status_callback_method="POST",
+                           sms_url=f"{PUBLIC_BASE_URL}/twilio/sms", sms_method="POST")
+    sb.table(TABLE_LOC).update({"elevenlabs_phone_id": None}).eq("id", loc["id"]).execute()
+
+
+# ---------------------------------------------------------------------------
+# PLANS & BILLING — what the Plans & billing page uses.
+# ---------------------------------------------------------------------------
+def _customer_or_404(customer_id: str) -> dict:
+    r = sb.table(TABLE_CUST).select("*").eq("id", customer_id).limit(1).execute().data
+    if not r:
+        raise HTTPException(404, "Account not found.")
+    return r[0]
+
+
+@app.get("/billing/{customer_id}")
+def billing_overview(customer_id: str, authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    c = _customer_or_404(customer_id)
+    return {
+        "tier": c["tier"], "status": c["status"],
+        "plans": [{"tier": t, "name": PLAN_NAMES[t], "price": PLAN_PRICES[t], "available": bool(price_for_tier(t))}
+                  for t in ("basic", "pro", "elite")],
+        "trial_ends_at": c.get("trial_ends_at"), "current_period_end": c.get("current_period_end"),
+        "cancel_at_period_end": bool(c.get("cancel_at_period_end")),
+        "has_subscription": bool(c.get("stripe_subscription_id")),
+        "email": c.get("email"), "email_verified": bool(c.get("email_verified_at")),
+    }
+
+
+@app.post("/billing/{customer_id}/checkout")
+def billing_checkout(customer_id: str, authorization: str = Header(None)):
+    """For accounts that signed up but never finished paying (or whose
+    subscription ended): opens a fresh Stripe Checkout for their plan."""
+    require_auth(customer_id, authorization)
+    require_stripe()
+    c = _customer_or_404(customer_id)
+    if c.get("stripe_subscription_id") and c["status"] in ACTIVE_STATUSES + ("past_due",):
+        raise HTTPException(409, "You already have a subscription — use Change plan or Manage billing instead.")
+    if c["status"] == "canceled":
+        sb.table(TABLE_CUST).update({"status": "pending_payment", "stripe_subscription_id": None}).eq("id", customer_id).execute()
+    return {"checkout_url": _new_checkout_session(c)}
+
+
+class ConfirmIn(BaseModel):
+    session_id: str
+
+
+@app.post("/billing/{customer_id}/confirm")
+def billing_confirm(customer_id: str, body: ConfirmIn, authorization: str = Header(None)):
+    """The dashboard calls this right after Stripe sends the customer back, so
+    the account starts immediately even if the webhook is slow."""
+    require_auth(customer_id, authorization)
+    require_stripe()
+    if not re.fullmatch(r"cs_[A-Za-z0-9_]{10,200}", body.session_id or ""):
+        raise HTTPException(400, "Invalid checkout session.")
+    session = stripe.checkout.Session.retrieve(body.session_id)
+    if (session.get("metadata") or {}).get("customer_id") != customer_id:
+        raise HTTPException(403, "That checkout belongs to a different account.")
+    if session.get("status") != "complete":
+        return {"ok": False, "status": session.get("status")}
+    result = finalize_account(customer_id, session.get("subscription"))
+    c = _customer_or_404(customer_id)
+    return {"ok": True, "status": c["status"], "tier": c["tier"], **result}
+
+
+class PlanIn(BaseModel):
+    tier: str
+
+
+@app.post("/billing/{customer_id}/change-plan")
+def billing_change_plan(customer_id: str, body: PlanIn, authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    require_stripe()
+    new_tier = body.tier
+    if new_tier not in PLAN_PRICES:
+        raise HTTPException(422, "Choose Basic, Pro or Elite.")
+    rate_limit("plan-change", customer_id, 10, 60 * 60)
+    c = _customer_or_404(customer_id)
+    old_tier = c["tier"]
+    price_id = price_for_tier(new_tier)
+    if not price_id:
+        raise HTTPException(503, "That plan isn't available right now — contact support@callskept.com.")
+    if c["status"] in ("pending_payment", "canceled") or not c.get("stripe_subscription_id"):
+        # No live subscription → the new plan only starts once checkout is paid.
+        sb.table(TABLE_CUST).update({"tier": new_tier, "status": "pending_payment",
+                                     "stripe_subscription_id": None}).eq("id", customer_id).execute()
+        return {"ok": True, "tier": new_tier, "checkout_url": _new_checkout_session({**c, "tier": new_tier})}
+    if new_tier == old_tier:
+        return {"ok": True, "tier": new_tier, "unchanged": True}
+    if c["status"] == "past_due":
+        raise HTTPException(402, "Please update your card first (Manage billing), then change your plan.")
+    sub = stripe.Subscription.retrieve(c["stripe_subscription_id"])
+    item_id = sub["items"]["data"][0]["id"]
+    upgrading = PLAN_RANK[new_tier] > PLAN_RANK[old_tier]
+    sub = stripe.Subscription.modify(
+        c["stripe_subscription_id"],
+        items=[{"id": item_id, "price": price_id}],
+        # Upgrades on a paid plan bill the difference now (otherwise upgrade-then-cancel
+        # would get the higher plan free). During the trial nothing is charged either way.
+        proration_behavior="always_invoice" if upgrading and sub.get("status") == "active" else "create_prorations",
+        cancel_at_period_end=False,
+        metadata={"customer_id": customer_id},
+    )
+    _sync_subscription(customer_id, sub)  # moves the tier and switches voice on/off
+    if (sb.table(TABLE_CUST).select("tier").eq("id", customer_id).execute().data or [{}])[0].get("tier") != new_tier:
+        # Pro and Elite can share a Stripe price; the choice they made wins.
+        sb.table(TABLE_CUST).update({"tier": new_tier}).eq("id", customer_id).execute()
+        apply_tier_change(customer_id, old_tier, new_tier)
+    sb.table(TABLE_CUST).update({"plan_changed_at": datetime.now(timezone.utc).isoformat()}).eq("id", customer_id).execute()
+    up = PLAN_RANK[new_tier] > PLAN_RANK[old_tier]
+    notify_account(c, f"Your CallsKept plan is now {PLAN_NAMES[new_tier]}",
+                   f"Your plan changed from {PLAN_NAMES[old_tier]} to {PLAN_NAMES[new_tier]} "
+                   f"(${PLAN_PRICES[new_tier]}/month). "
+                   + ("Your new features are on now. You've been charged only the difference for the rest of this period."
+                      if up and c["status"] == "active" else "Your new features are on now."
+                      if up else "Any unused time is credited on your next bill."))
+    return {"ok": True, "tier": new_tier, "upgraded": up}
+
+
+class CancelIn(BaseModel):
+    reason: Optional[str] = None
+
+
+@app.post("/billing/{customer_id}/cancel")
+def billing_cancel(customer_id: str, body: Optional[CancelIn] = None, authorization: str = Header(None)):
+    """Cancels at the end of the current period (or trial) — nothing is cut
+    off early and they can undo it until then."""
+    require_auth(customer_id, authorization)
+    require_stripe()
+    c = _customer_or_404(customer_id)
+    if not c.get("stripe_subscription_id"):
+        raise HTTPException(409, "There's no active subscription to cancel.")
+    sub = stripe.Subscription.modify(c["stripe_subscription_id"], cancel_at_period_end=True)
+    upd = _sync_subscription(customer_id, sub)
+    end = upd.get("current_period_end") or upd.get("trial_ends_at") or c.get("trial_ends_at")
+    when = _friendly_date(end)
+    notify_account(c, "Your CallsKept subscription is set to cancel",
+                   f"Your subscription will end on {when}. You keep full access until then, and you can "
+                   "undo this anytime before that from Plans & billing.")
+    reason = ((body.reason if body else None) or "").strip()[:2000]
+    if reason:
+        sb.table("recall_feedback").insert({"customer_id": customer_id, "kind": "cancel_reason", "message": reason,
+                                            "page": "plans"}).execute()
+    alert_platform_owner(f"CallsKept cancellation: {c.get('business_name')} ({c.get('email')}) — ends {when}"
+                         + (f". Reason: {reason[:200]}" if reason else ""))
+    return {"ok": True, "cancel_at_period_end": True, "ends_at": end}
+
+
+@app.post("/billing/{customer_id}/resume")
+def billing_resume(customer_id: str, authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    require_stripe()
+    c = _customer_or_404(customer_id)
+    if not c.get("stripe_subscription_id"):
+        raise HTTPException(409, "There's no subscription to resume — start a new one from Plans & billing.")
+    sub = stripe.Subscription.modify(c["stripe_subscription_id"], cancel_at_period_end=False)
+    _sync_subscription(customer_id, sub)
+    notify_account(c, "Your CallsKept subscription will continue",
+                   "Good news — your cancellation is undone and your subscription continues as normal.")
+    return {"ok": True, "cancel_at_period_end": False}
+
+
+@app.post("/billing/{customer_id}/portal")
+def billing_portal(customer_id: str, authorization: str = Header(None)):
+    """Stripe's secure page for updating the card and downloading invoices."""
+    require_auth(customer_id, authorization)
+    require_stripe()
+    c = _customer_or_404(customer_id)
+    if not c.get("stripe_customer_id"):
+        raise HTTPException(409, "There's no billing account yet — finish checkout first.")
+    try:
+        session = stripe.billing_portal.Session.create(
+            customer=c["stripe_customer_id"],
+            return_url=f"{FRONTEND_BASE_URL}/plans.html?customer_id={customer_id}")
+    except Exception as e:
+        log.error(f"Billing portal failed for {customer_id}: {e}")
+        raise HTTPException(502, "The billing page isn't available right now — email support@callskept.com and we'll update it for you.")
+    return {"url": session.url}
+
+
+def _friendly_date(iso: str) -> str:
+    if not iso:
+        return "the end of your current billing period"
+    try:
+        from zoneinfo import ZoneInfo
+        d = datetime.fromisoformat(str(iso).replace("Z", "+00:00")).astimezone(ZoneInfo("America/New_York"))
+        return d.strftime("%B %-d, %Y")
+    except Exception:
+        return str(iso)[:10]
+
+
+# ---------------------------------------------------------------------------
+# ACCOUNT EMAILS + TEXTS — verification, welcome, billing notices, password
+# reset, lifecycle follow-ups. Email goes through Resend (RESEND_API_KEY);
+# without a key the app still runs and logs what it would have sent, and the
+# important notices also go out by text to the owner's business phone.
+# ---------------------------------------------------------------------------
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
+EMAIL_FROM = os.environ.get("EMAIL_FROM", "CallsKept <hello@callskept.com>")
+EMAIL_REPLY_TO = os.environ.get("EMAIL_REPLY_TO", "support@callskept.com")
+
+
+def _email_html(heading: str, text: str, button_text: str = None, button_url: str = None, footer: str = None) -> str:
+    esc = html.escape
+    paras = "".join(f'<p style="margin:0 0 14px;line-height:1.55">{esc(p).replace(chr(10), "<br>")}</p>'
+                    for p in text.split("\n\n") if p.strip())
+    button = ""
+    if button_text and button_url:
+        button = (f'<p style="margin:22px 0"><a href="{esc(button_url, quote=True)}" style="background:#4f46e5;color:#fff;'
+                  f'padding:12px 22px;border-radius:8px;text-decoration:none;font-weight:600;display:inline-block">{esc(button_text)}</a></p>'
+                  f'<p style="font-size:12px;color:#6b7280;word-break:break-all">Or paste this link into your browser: {esc(button_url)}</p>')
+    foot = esc(footer or "You're getting this because you have a CallsKept account.")
+    return (f'<div style="font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#f6f7fb;padding:24px">'
+            f'<div style="max-width:560px;margin:0 auto;background:#fff;border-radius:12px;padding:28px;color:#111827">'
+            f'<div style="font-weight:700;font-size:18px;margin-bottom:18px">CallsKept</div>'
+            f'<h1 style="font-size:20px;margin:0 0 16px">{esc(heading)}</h1>{paras}{button}</div>'
+            f'<p style="max-width:560px;margin:14px auto 0;font-size:12px;color:#6b7280;text-align:center">{foot}</p></div>')
+
+
+def send_email(to: str, subject: str, text: str, *, kind: str = "notice", customer_id: str = None,
+               button_text: str = None, button_url: str = None, footer: str = None) -> bool:
+    """Sends one email. Never raises — a failed email must not break signup or billing."""
+    if not to:
+        return False
+    body_text = text + (f"\n\n{button_text}: {button_url}" if button_url else "")
+    row = {"customer_id": customer_id, "to_email": to, "kind": kind, "subject": subject}
+    if not RESEND_API_KEY:
+        log.warning(f"[email not sent — RESEND_API_KEY missing] to={to} subject={subject!r}")
+        row["error"] = "RESEND_API_KEY not set"
+        ok = False
+    else:
+        try:
+            r = requests.post("https://api.resend.com/emails", timeout=15,
+                              headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
+                              json={"from": EMAIL_FROM, "to": [to], "subject": subject, "reply_to": EMAIL_REPLY_TO,
+                                    "text": body_text,
+                                    "html": _email_html(subject, text, button_text, button_url, footer)})
+            if r.status_code >= 300:
+                raise RuntimeError(f"Resend {r.status_code}: {r.text[:200]}")
+            row["provider_id"] = (r.json() or {}).get("id")
+            ok = True
+        except Exception as e:
+            log.error(f"Email to {to} failed: {e}")
+            row["error"] = str(e)[:300]
+            ok = False
+    try:
+        sb.table("recall_email_log").insert(row).execute()
+    except Exception:
+        pass
+    return ok
+
+
+def send_platform_sms(to: str, body: str) -> bool:
+    """Texts from CallsKept itself (account notices), not from a customer's number."""
+    if not to or twilio_client is None or not is_us_number(to):
+        return False
+    try:
+        if not TWILIO_MESSAGING_SERVICE_SID:
+            return False
+        twilio_client.messages.create(to=to, body=body[:640], messaging_service_sid=TWILIO_MESSAGING_SERVICE_SID)
+        return True
+    except Exception as e:
+        log.error(f"Platform SMS to {to} failed: {e}")
+        return False
+
+
+def _account_phone(customer: dict) -> Optional[str]:
+    try:
+        loc = get_primary_location(customer["id"])
+        return loc.get("transfer_phone") or loc.get("business_phone")
+    except Exception:
+        return None
+
+
+def notify_account(customer: dict, subject: str, text: str, *, sms: bool = True,
+                   button_text: str = "Open Plans & billing", button_path: str = "plans.html") -> None:
+    """Billing/account notices: email, plus a short text so it isn't missed."""
+    url = f"{FRONTEND_BASE_URL}/{button_path}?customer_id={customer['id']}" if button_path else None
+    send_email(customer.get("email"), subject, text, kind="account", customer_id=customer["id"],
+               button_text=button_text if url else None, button_url=url)
+    if sms:
+        send_platform_sms(_account_phone(customer), f"CallsKept: {subject}. Details sent to {customer.get('email')}.")
+
+
+def alert_platform_owner(text: str) -> None:
+    """Pings the CallsKept owner (app setting owner_alert_phone / owner_alert_email)."""
+    log.info(f"OWNER ALERT: {text}")
+    phone = app_setting("owner_alert_phone")
+    email = app_setting("owner_alert_email")
+    if phone:
+        send_platform_sms(str(phone), text)
+    if email:
+        send_email(str(email), "CallsKept alert", text, kind="owner_alert")
+
+
+def send_verification_email(customer: dict) -> bool:
+    token = make_purpose_token(customer["id"], "verify_email", 60 * 24 * 3, email=customer.get("email"))
+    url = f"{FRONTEND_BASE_URL}/verify-email.html?token={token}"
+    return send_email(customer.get("email"), "Confirm your email for CallsKept",
+                      f"Hi {customer.get('owner_name') or 'there'},\n\nPlease confirm this is your email so we can send you "
+                      "billing receipts, call summaries and password resets.\n\nThe link works for 3 days.",
+                      kind="verify", customer_id=customer["id"], button_text="Confirm my email", button_url=url,
+                      footer="If you didn't sign up for CallsKept, you can ignore this email.")
+
+
+def _pretty_phone(e164: str) -> str:
+    d = re.sub(r"\D", "", e164 or "")[-10:]
+    return f"({d[:3]}) {d[3:6]}-{d[6:]}" if len(d) == 10 else (e164 or "")
+
+
+def send_welcome(customer: dict, number: str, business_phone: str = None) -> None:
+    tier = customer.get("tier", "basic")
+    dash = f"{FRONTEND_BASE_URL}/dashboard.html?customer_id={customer['id']}"
+    if number:
+        n = _pretty_phone(number)
+        ten = re.sub(r"\D", "", number)[-10:]
+        steps = (f"Your CallsKept number is {n}.\n\n"
+                 f"Step 1 — Forward missed calls to it. On most cell phones dial *61*{ten}# (AT&T / T-Mobile) "
+                 f"or *71{ten} (Verizon) from your business line. The dashboard has instructions for every carrier.\n\n"
+                 "Step 2 — Call your business line and let it ring out. You'll get the text-back within a minute.")
+        if tier in ("pro", "elite"):
+            steps += "\n\nStep 3 — Open Voice assistant in the dashboard to set your AI receptionist's greeting and hours."
+    else:
+        steps = ("We're finishing setting up your CallsKept phone number — it'll show on your dashboard shortly. "
+                 "We'll text you as soon as it's ready.")
+    text = (f"Welcome to CallsKept, {customer.get('owner_name') or customer.get('business_name')}!\n\n"
+            f"Your 7-day free trial of the {PLAN_NAMES.get(tier, tier.title())} plan has started. "
+            "You won't be charged until it ends, and you can change plans or cancel anytime in Plans & billing.\n\n"
+            + steps + "\n\nQuestions? Just reply to this email.")
+    send_email(customer.get("email"), "Welcome to CallsKept — your number is ready" if number else "Welcome to CallsKept",
+               text, kind="welcome", customer_id=customer["id"], button_text="Open my dashboard", button_url=dash)
+    if business_phone and number:
+        send_platform_sms(business_phone, f"Welcome to CallsKept! Your number is {_pretty_phone(number)}. "
+                                          "Forward missed calls to it and you're live. Setup steps are in your email.")
+    sb.table(TABLE_CUST).update({"welcome_sent_at": datetime.now(timezone.utc).isoformat()}).eq("id", customer["id"]).execute()
+
+
+def subscriber_tags(c: dict) -> list:
+    """Segments used for follow-ups and announcements — computed, so never stale."""
+    tags = [f"plan:{c.get('tier')}", f"status:{c.get('status')}"]
+    tags.append("email:verified" if c.get("email_verified_at") else "email:unverified")
+    if c.get("cancel_at_period_end"):
+        tags.append("canceling")
+    if c.get("marketing_opt_out"):
+        tags.append("no-marketing")
+    return tags
+
+
+class EmailIn(BaseModel):
+    email: str
+
+
+class TokenIn(BaseModel):
+    token: str
+
+
+class ResetIn(BaseModel):
+    token: str
+    new_password: str
+
+
+def _pwd_fingerprint(password_hash: str) -> str:
+    return hashlib.sha256((password_hash or "").encode()).hexdigest()[:16]
+
+
+@app.post("/auth/verify-email")
+def verify_email(body: TokenIn):
+    p = read_purpose_token(body.token, "verify_email")
+    rows = sb.table(TABLE_CUST).select("id, email, email_verified_at").eq("id", p["customer_id"]).limit(1).execute().data
+    if not rows or rows[0]["email"] != p.get("email"):
+        raise HTTPException(400, "This link is for an older email address — request a new one from your dashboard.")
+    if not rows[0].get("email_verified_at"):
+        sb.table(TABLE_CUST).update({"email_verified_at": datetime.now(timezone.utc).isoformat()}).eq("id", rows[0]["id"]).execute()
+    return {"ok": True, "customer_id": rows[0]["id"]}
+
+
+@app.post("/auth/resend-verification/{customer_id}")
+def resend_verification(customer_id: str, authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    rate_limit("verify-resend", customer_id, 3, 60 * 60, "We've sent a few already — check your spam folder, or try again in an hour.")
+    c = _customer_or_404(customer_id)
+    if c.get("email_verified_at"):
+        return {"ok": True, "already_verified": True}
+    return {"ok": True, "sent": send_verification_email(c)}
+
+
+@app.post("/auth/forgot-password")
+def forgot_password(body: EmailIn, request: Request, background: BackgroundTasks):
+    email = (body.email or "").strip().lower()
+    rate_limit("forgot-ip", client_ip(request), 10, 60 * 60)
+    rate_limit("forgot-email", email, 3, 60 * 60)
+    rows = sb.table(TABLE_CUST).select("id, email, owner_name, password_hash").eq("email", email).limit(1).execute().data
+    if rows:  # same answer (and timing) either way, so this can't reveal who has an account
+        background.add_task(_send_reset_link, rows[0], email)
+    return {"ok": True, "message": "If that email has a CallsKept account, a reset link is on its way."}
+
+
+def _send_reset_link(c: dict, email: str):
+    if True:
+        token = make_purpose_token(c["id"], "pwd_reset", 60, fp=_pwd_fingerprint(c.get("password_hash")))
+        url = f"{FRONTEND_BASE_URL}/reset-password.html?token={token}"
+        sent = send_email(email, "Reset your CallsKept password",
+                          "Someone (hopefully you) asked to reset your CallsKept password. The link works for 1 hour "
+                          "and only once.\n\nIf this wasn't you, ignore this email — your password stays the same.",
+                          kind="pwd_reset", customer_id=c["id"], button_text="Choose a new password", button_url=url)
+        if not sent:  # email not set up yet → text the reset link to the business phone instead
+            send_platform_sms(_account_phone(c), f"CallsKept password reset (valid 1 hour): {url}")
+
+
+@app.post("/auth/reset-password")
+def reset_password(body: ResetIn, request: Request):
+    rate_limit("reset-ip", client_ip(request), 20, 60 * 60)
+    p = read_purpose_token(body.token, "pwd_reset")
+    if len(body.new_password or "") < 8:
+        raise HTTPException(400, "New password must be at least 8 characters.")
+    rows = sb.table(TABLE_CUST).select("id, email, password_hash").eq("id", p["customer_id"]).limit(1).execute().data
+    if not rows or _pwd_fingerprint(rows[0].get("password_hash")) != p.get("fp"):
+        raise HTTPException(400, "This reset link has already been used — request a new one.")
+    now = datetime.now(timezone.utc).isoformat()
+    sb.table(TABLE_CUST).update({"password_hash": hash_password(body.new_password), "password_changed_at": now,
+                                 "email_verified_at": now}).eq("id", rows[0]["id"]).execute()
+    _PWD_CHANGED_CACHE.pop(rows[0]["id"], None)
+    send_email(rows[0]["email"], "Your CallsKept password was changed",
+               "Your password was just changed and you've been signed out on other devices. "
+               "If this wasn't you, reply to this email right away.", kind="security", customer_id=rows[0]["id"])
+    return {"ok": True, "customer_id": rows[0]["id"], "token": make_token(rows[0]["id"])}
+
+
+# ---------------------------------------------------------------------------
+# FEEDBACK — in-app "Send feedback" box. Stored, and the owner gets a text.
+# ---------------------------------------------------------------------------
+class FeedbackIn(BaseModel):
+    message: str
+    kind: str = "feedback"
+    rating: Optional[int] = None
+    page: Optional[str] = None
+
+
+@app.post("/feedback/{customer_id}")
+def submit_feedback(customer_id: str, body: FeedbackIn, authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    rate_limit("feedback", customer_id, 10, 60 * 60)
+    msg = (body.message or "").strip()[:4000]
+    if not msg:
+        raise HTTPException(400, "Please write a message.")
+    kind = body.kind if body.kind in ("feedback", "bug", "idea", "question", "cancel_reason") else "feedback"
+    rating = body.rating if body.rating and 1 <= body.rating <= 5 else None
+    sb.table("recall_feedback").insert({"customer_id": customer_id, "kind": kind, "rating": rating,
+                                        "message": msg, "page": (body.page or "")[:200] or None}).execute()
+    c = _customer_or_404(customer_id)
+    alert_platform_owner(f"💬 CallsKept {kind} from {c.get('business_name')}"
+                         f"{f' ({rating}★)' if rating else ''}: {msg[:300]}")
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# ADMIN — subscriber list with tags, and announcements to a tag.
+# ---------------------------------------------------------------------------
+@app.get("/admin/subscribers")
+def admin_subscribers(tag: str = None, authorization: str = Header(None)):
+    require_admin(authorization)
+    rows = sb.table(TABLE_CUST).select(
+        "id, business_name, owner_name, email, tier, status, email_verified_at, cancel_at_period_end, "
+        "marketing_opt_out, trial_ends_at, current_period_end, created_at").order("created_at", desc=True).limit(2000).execute().data
+    out = [{**r, "tags": subscriber_tags(r)} for r in rows]
+    return [r for r in out if not tag or tag in r["tags"]]
+
+
+class BroadcastIn(BaseModel):
+    tag: str
+    subject: str
+    message: str
+    dry_run: bool = True
+
+
+@app.post("/admin/broadcast")
+def admin_broadcast(body: BroadcastIn, authorization: str = Header(None)):
+    """Email everyone with a tag (e.g. plan:pro, status:trial). dry_run lists who
+    would get it. Product/marketing news skips anyone who opted out."""
+    require_admin(authorization)
+    targets = [r for r in admin_subscribers(body.tag, authorization) if "no-marketing" not in r["tags"]]
+    if body.dry_run:
+        return {"would_send": len(targets), "emails": [t["email"] for t in targets][:200]}
+    sent = 0
+    for t in targets[:1000]:
+        unsub = make_purpose_token(t["id"], "unsubscribe", 60 * 24 * 365)
+        sent += send_email(t["email"], body.subject[:150], body.message[:5000], kind="broadcast", customer_id=t["id"],
+                           footer=f"Don't want product news? Unsubscribe: {PUBLIC_BASE_URL}/email/unsubscribe?token={unsub}")
+    return {"sent": sent, "targets": len(targets)}
+
+
+@app.get("/email/unsubscribe", response_class=HTMLResponse)
+def email_unsubscribe(token: str):
+    try:
+        p = read_purpose_token(token, "unsubscribe")
+        sb.table(TABLE_CUST).update({"marketing_opt_out": True}).eq("id", p["customer_id"]).execute()
+        msg = "You're unsubscribed from CallsKept product news. You'll still get billing and security emails."
+    except HTTPException as e:
+        msg = e.detail
+    return HTMLResponse(f'<html><body style="font-family:sans-serif;max-width:520px;margin:60px auto;padding:0 16px">'
+                        f'<h2>CallsKept</h2><p>{html.escape(str(msg))}</p></body></html>')
+
+
+def run_lifecycle_followups(now: datetime) -> dict:
+    """Account follow-ups, run from the 5-minute job. Each one sends once."""
+    out = {"checkout_reminders": 0, "onboarding_nudges": 0, "winbacks": 0, "setups_finished": 0}
+    # 0. Paid but setup didn't finish (number purchase failed etc.) → retry
+    rows = (sb.table(TABLE_CUST).select("id").in_("status", list(ACTIVE_STATUSES)).is_("welcome_sent_at", "null")
+            .lte("updated_at", (now - timedelta(minutes=5)).isoformat()).limit(5).execute()).data
+    for c in rows:
+        try:
+            if finalize_account(c["id"]).get("twilio_number"):
+                out["setups_finished"] += 1
+        except Exception as e:
+            log.error(f"Setup retry for {c['id']} failed: {e}")
+    # 1. Signed up but never finished checkout (after 24h)
+    rows = (sb.table(TABLE_CUST).select("*").eq("status", "pending_payment").is_("checkout_reminder_at", "null")
+            .lte("created_at", (now - timedelta(hours=24)).isoformat())
+            .gte("created_at", (now - timedelta(days=7)).isoformat()).limit(25).execute()).data
+    for c in rows:
+        sb.table(TABLE_CUST).update({"checkout_reminder_at": now.isoformat()}).eq("id", c["id"]).execute()
+        send_email(c["email"], "Finish setting up CallsKept",
+                   f"Hi {c.get('owner_name') or 'there'},\n\nYour CallsKept account for {c.get('business_name')} is almost ready — "
+                   "you just need to start your free trial. You won't be charged for 7 days and can cancel anytime.",
+                   kind="checkout_reminder", customer_id=c["id"], button_text="Start my free trial",
+                   button_url=f"{FRONTEND_BASE_URL}/plans.html?customer_id={c['id']}")
+        out["checkout_reminders"] += 1
+    # 2. Trial started 48h ago but no calls have come in → forwarding probably isn't on
+    rows = (sb.table(TABLE_CUST).select("*").in_("status", ["trial", "active"]).is_("onboarding_nudge_at", "null")
+            .not_.is_("welcome_sent_at", "null").lte("welcome_sent_at", (now - timedelta(hours=48)).isoformat())
+            .limit(25).execute()).data
+    for c in rows:
+        sb.table(TABLE_CUST).update({"onboarding_nudge_at": now.isoformat()}).eq("id", c["id"]).execute()
+        calls = sb.table(TABLE_CALLS).select("id").eq("customer_id", c["id"]).limit(1).execute().data
+        if calls:
+            continue
+        notify_account(c, "We haven't seen any calls yet",
+                       "Your CallsKept number hasn't received a forwarded call yet, so missed callers aren't getting texts. "
+                       "Most of the time call forwarding just needs to be turned on — the dashboard shows the exact code "
+                       "for your carrier. It takes about a minute.\n\nReply to this email if you'd like us to help.",
+                       button_text="Show me how", button_path="dashboard.html")
+        out["onboarding_nudges"] += 1
+    # 3. Canceled 14+ days ago → one win-back note (respects marketing opt-out)
+    rows = (sb.table(TABLE_CUST).select("*").eq("status", "canceled").is_("winback_sent_at", "null")
+            .eq("marketing_opt_out", False).lte("updated_at", (now - timedelta(days=14)).isoformat())
+            .gte("updated_at", (now - timedelta(days=60)).isoformat()).limit(25).execute()).data
+    for c in rows:
+        sb.table(TABLE_CUST).update({"winback_sent_at": now.isoformat()}).eq("id", c["id"]).execute()
+        unsub = make_purpose_token(c["id"], "unsubscribe", 60 * 24 * 365)
+        send_email(c["email"], "Your CallsKept contacts are still saved",
+                   "Since you left, missed calls aren't getting a text back. Your contacts, notes and settings are still "
+                   "saved — restart anytime and everything picks up where it left off.\n\nIf something didn't work for you, "
+                   "just reply and tell us. We read every reply.",
+                   kind="winback", customer_id=c["id"], button_text="Restart CallsKept",
+                   button_url=f"{FRONTEND_BASE_URL}/plans.html?customer_id={c['id']}",
+                   footer=f"Don't want these? Unsubscribe: {PUBLIC_BASE_URL}/email/unsubscribe?token={unsub}")
+        out["winbacks"] += 1
+    return out
 
 
 # ---------------------------------------------------------------------------
 # LOGIN — email + password, returns a bearer token good for 30 days.
 # ---------------------------------------------------------------------------
 @app.post("/login")
-async def login(email: str = Form(...), password: str = Form(...)):
-    cust = sb.table(TABLE_CUST).select("id, password_hash").eq("email", email).execute()
+async def login(request: Request, email: str = Form(...), password: str = Form(...)):
+    email = (email or "").strip().lower()
+    rate_limit("login-ip", client_ip(request), 30, 15 * 60)
+    rate_limit("login-email", email, 10, 15 * 60,
+               "Too many sign-in attempts for this email — wait 15 minutes or reset your password.")
+    cust = sb.table(TABLE_CUST).select("id, password_hash").eq("email", email).limit(1).execute()
     if not cust.data or not cust.data[0].get("password_hash"):
+        await run_in_threadpool(verify_password, password, "00$00")  # same timing either way
         raise HTTPException(401, "Incorrect email or password.")
     customer = cust.data[0]
-    if not verify_password(password, customer["password_hash"]):
+    if not await run_in_threadpool(verify_password, password, customer["password_hash"]):
         raise HTTPException(401, "Incorrect email or password.")
     return {"customer_id": customer["id"], "token": make_token(customer["id"])}
 
@@ -964,7 +1880,7 @@ async def login(email: str = Form(...), password: str = Form(...)):
 # ends and /twilio/status fires with an unanswered result, triggering the
 # text-back for that specific location.
 # ---------------------------------------------------------------------------
-@app.post("/twilio/voice")
+@app.post("/twilio/voice", dependencies=[Depends(verify_twilio)])
 async def twilio_voice(request: Request):
     form = await request.form()
     to_number = form.get("To")
@@ -1034,7 +1950,7 @@ async def send_missed_call_text(to_number: str, caller: str, call_sid: str):
         log.error(f"Couldn't save missed-call row for {call_sid}: {e}")
 
 
-@app.post("/twilio/dial-result")
+@app.post("/twilio/dial-result", dependencies=[Depends(verify_twilio)])
 async def twilio_dial_result(request: Request):
     form = await request.form()
     to_number = form.get("To")
@@ -1055,7 +1971,7 @@ async def twilio_dial_result(request: Request):
     return PlainTextResponse(str(resp), media_type="application/xml")
 
 
-@app.post("/twilio/status")
+@app.post("/twilio/status", dependencies=[Depends(verify_twilio)])
 async def twilio_status(request: Request):
     """Fires on every call to this number regardless of who answered it —
     Twilio calls this independently of the voice webhook, so it still fires
@@ -1093,45 +2009,84 @@ async def stripe_webhook(request: Request):
     try:
         event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
     except Exception as e:
-        raise HTTPException(400, f"Webhook signature verification failed: {e}")
+        log.warning(f"Stripe webhook signature check failed: {e}")
+        raise HTTPException(400, "Webhook signature verification failed.")
+    try:
+        sb.table("recall_stripe_events").insert({"id": event["id"], "type": event["type"]}).execute()
+    except Exception as e:
+        if "23505" in str(e) or "duplicate" in str(e).lower():
+            return JSONResponse({"received": True, "duplicate": True})  # Stripe retry of one we already handled
+        log.error(f"Couldn't record Stripe event {event['id']}: {e}")
+        raise HTTPException(500, "Try again.")  # Stripe will retry
+    try:
+        await run_in_threadpool(_handle_stripe_event, event)
+    except Exception as e:
+        log.error(f"Stripe webhook {event['type']} failed: {e}")
+        try:
+            sb.table("recall_stripe_events").delete().eq("id", event["id"]).execute()  # let Stripe retry
+        except Exception as e2:
+            log.error(f"Couldn't clear Stripe event {event['id']} for retry: {e2}")
+            alert_platform_owner(f"⚠️ CallsKept: Stripe event {event['id']} ({event['type']}) failed and won't retry — check it.")
+        raise HTTPException(500, "Webhook handling failed.")
+    return JSONResponse({"received": True})
 
+
+def _customer_for_stripe(obj: dict) -> Optional[dict]:
+    cid = (obj.get("metadata") or {}).get("customer_id")
+    q = sb.table(TABLE_CUST).select("*")
+    rows = q.eq("id", cid).limit(1).execute().data if cid else None
+    if not rows and obj.get("customer"):
+        rows = sb.table(TABLE_CUST).select("*").eq("stripe_customer_id", obj["customer"]).limit(1).execute().data
+    if not rows and obj.get("subscription"):
+        rows = sb.table(TABLE_CUST).select("*").eq("stripe_subscription_id", obj["subscription"]).limit(1).execute().data
+    return rows[0] if rows else None
+
+
+def _handle_stripe_event(event: dict):
     etype = event["type"]
     data = event["data"]["object"]
-
-    def set_status(customer_id: str, status: str):
-        sb.table(TABLE_CUST).update(
-            {"status": status, "updated_at": datetime.now(timezone.utc).isoformat()}
-        ).eq("id", customer_id).execute()
-
     if etype == "checkout.session.completed":
-        cid = data.get("metadata", {}).get("customer_id")
-        if cid:
-            sb.table(TABLE_CUST).update(
-                {"stripe_subscription_id": data.get("subscription"), "status": "trial"}
-            ).eq("id", cid).execute()
-
-    elif etype == "customer.subscription.trial_will_end":
-        pass  # hook point: send a "trial ending" reminder email/SMS
-
-    elif etype == "invoice.payment_succeeded":
-        sub_id = data.get("subscription")
-        sb.table(TABLE_CUST).update({"status": "active"}).eq(
-            "stripe_subscription_id", sub_id
-        ).execute()
-
-    elif etype == "invoice.payment_failed":
-        sub_id = data.get("subscription")
-        sb.table(TABLE_CUST).update({"status": "past_due"}).eq(
-            "stripe_subscription_id", sub_id
-        ).execute()
-
+        cid = (data.get("metadata") or {}).get("customer_id")
+        if cid and data.get("status") == "complete":
+            finalize_account(cid, data.get("subscription"))
+        return
+    c = _customer_for_stripe(data)
+    if not c:
+        log.info(f"Stripe {etype}: no matching CallsKept account")
+        return
+    if etype in ("customer.subscription.created", "customer.subscription.updated"):
+        if c.get("stripe_subscription_id") in (None, data.get("id")):
+            if not c.get("stripe_subscription_id"):
+                sb.table(TABLE_CUST).update({"stripe_subscription_id": data.get("id")}).eq("id", c["id"]).execute()
+            if c["status"] != "pending_payment":
+                _sync_subscription(c["id"], stripe.Subscription.retrieve(data["id"]))
     elif etype == "customer.subscription.deleted":
-        sub_id = data.get("id")
-        sb.table(TABLE_CUST).update({"status": "canceled"}).eq(
-            "stripe_subscription_id", sub_id
-        ).execute()
-
-    return JSONResponse({"received": True})
+        if c.get("stripe_subscription_id") == data.get("id"):
+            _sync_subscription(c["id"], {**data, "status": "canceled"})
+            notify_account(c, "Your CallsKept subscription has ended",
+                           "Your subscription has ended, so CallsKept has stopped answering and texting for you. "
+                           "Your contacts and history are saved — restart anytime from Plans & billing.")
+    elif etype == "customer.subscription.trial_will_end":
+        notify_account(c, "Your CallsKept trial ends in 3 days",
+                       f"Your free trial ends on {_friendly_date(c.get('trial_ends_at'))}. Your {PLAN_NAMES.get(c['tier'], '')} "
+                       f"plan (${PLAN_PRICES.get(c['tier'], '')}/month) starts then on the card you added. "
+                       "To change plans or cancel, open Plans & billing.")
+    elif etype == "invoice.payment_succeeded":
+        if c["status"] in ("past_due", "trial", "paused") and (data.get("amount_paid") or 0) > 0 \
+                and data.get("subscription") == c.get("stripe_subscription_id"):
+            sb.table(TABLE_CUST).update({"status": "active"}).eq("id", c["id"]).execute()
+            if c["status"] in ("past_due", "paused"):
+                apply_tier_change(c["id"], None, c["tier"])  # voice back on
+    elif etype == "invoice.payment_failed":
+        if data.get("subscription") and data.get("subscription") != c.get("stripe_subscription_id"):
+            return
+        sb.table(TABLE_CUST).update({"status": "past_due"}).eq("id", c["id"]).execute()
+        if c["status"] != "past_due":
+            apply_tier_change(c["id"], c["tier"], c["tier"], canceled=True)  # pause AI voice minutes
+        notify_account(c, "Action needed: your CallsKept payment didn't go through",
+                       "We couldn't charge your card, so missed-call texts and AI answering are paused. "
+                       "Update your card in Plans & billing → Manage billing and everything turns back on right away.")
+        alert_platform_owner(f"CallsKept payment failed: {c.get('business_name')} ({c.get('email')})")
 
 
 # ---------------------------------------------------------------------------
@@ -1148,7 +2103,7 @@ def get_account(customer_id: str, authorization: str = Header(None)):
     require_auth(customer_id, authorization)
     cust = sb.table(TABLE_CUST).select(
         "business_name, owner_name, email, business_phone, "
-        "address_line1, address_city, address_state, address_zip, tier, status"
+        "address_line1, address_city, address_state, address_zip, tier, status, email_verified_at, cancel_at_period_end"
     ).eq("id", customer_id).execute()
     if not cust.data:
         raise HTTPException(404, "Not found")
@@ -1168,6 +2123,7 @@ def update_account(
     authorization: str = Header(None),
 ):
     require_auth(customer_id, authorization)
+    business_phone = normalize_us_phone(business_phone)  # US numbers only (blocks premium/intl toll fraud)
     business_name = business_name.strip()
     owner_name = owner_name.strip()
     if not business_name or not owner_name:
@@ -1199,8 +2155,10 @@ def change_password(
         raise HTTPException(404, "Not found")
     if not verify_password(current_password, cust.data[0]["password_hash"]):
         raise HTTPException(401, "Your current password is incorrect.")
-    sb.table(TABLE_CUST).update({"password_hash": hash_password(new_password)}).eq("id", customer_id).execute()
-    return {"ok": True}
+    sb.table(TABLE_CUST).update({"password_hash": hash_password(new_password),
+                                 "password_changed_at": datetime.now(timezone.utc).isoformat()}).eq("id", customer_id).execute()
+    _PWD_CHANGED_CACHE.pop(customer_id, None)
+    return {"ok": True, "token": make_token(customer_id)}
 
 
 
@@ -1415,7 +2373,7 @@ async def update_appointment(appointment_id: str, request: Request):
     return {"ok": True, "customer_notified": sent, "customer_called": called}
 
 
-@app.post("/twilio/cancellation-twiml/{appointment_id}")
+@app.post("/twilio/cancellation-twiml/{appointment_id}", dependencies=[Depends(verify_twilio)])
 async def cancellation_twiml(appointment_id: str):
     """Twilio fetches this when the cancellation call connects (including to
     voicemail — Twilio still plays <Say> content even if a machine picks up).
@@ -1471,15 +2429,22 @@ async def upload_business_info(
     authorization: str = Header(None),
 ):
     require_auth(customer_id, authorization)
+    require_active(customer_id)
     loc = get_location_for_customer(customer_id, location_id)
 
     try:
         import pypdf
         from io import BytesIO
-        reader = pypdf.PdfReader(BytesIO(await pdf.read()))
+        data = await _read_pdf_upload(pdf)
+        reader = pypdf.PdfReader(BytesIO(data))
+        if len(reader.pages) > 60:
+            raise HTTPException(413, "That PDF is too long — please keep it under 60 pages.")
         text = "\n".join(page.extract_text() or "" for page in reader.pages).strip()
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(400, f"Couldn't read that PDF: {e}")
+        log.warning(f"PDF parse failed: {e}")
+        raise HTTPException(400, "Couldn't read that PDF — try saving it again as a regular PDF.")
     if not text:
         raise HTTPException(400, "Couldn't find any readable text in that PDF.")
 
@@ -1506,7 +2471,7 @@ def get_business_info(customer_id: str, location_id: str = None, authorization: 
     return {"has_info": bool(text), "preview": text[:200], "location_id": loc["id"]}
 
 
-@app.post("/twilio/sms")
+@app.post("/twilio/sms", dependencies=[Depends(verify_twilio)])
 async def twilio_sms(request: Request):
     require_anthropic()
     form = await request.form()
@@ -1680,7 +2645,8 @@ async def twilio_sms(request: Request):
     try:
         reply_text = ""
         for _ in range(5):  # hard cap so a stuck tool loop can't run forever
-            resp = requests.post(
+            resp = await run_in_threadpool(
+                requests.post,
                 "https://api.anthropic.com/v1/messages",
                 headers={
                     "x-api-key": ANTHROPIC_API_KEY,
@@ -1753,7 +2719,7 @@ async def twilio_sms(request: Request):
 # ---------------------------------------------------------------------------
 REMINDER_JOB_SECRET = os.environ.get("REMINDER_JOB_SECRET")
 if not REMINDER_JOB_SECRET:
-    REMINDER_JOB_SECRET = secrets.token_hex(24)
+    REMINDER_JOB_SECRET = _derived_secret("reminder-job")
     log.warning("REMINDER_JOB_SECRET not set — using a random per-restart value. Set it in Render.")
 REMINDER_MIN_DELAY_SECONDS = int(os.environ.get("REMINDER_MIN_DELAY_SECONDS", "120"))
 
@@ -1776,7 +2742,7 @@ def business_local_time_str(appointment_start) -> str:
 
 @app.post("/internal/send-reminders")
 async def send_reminders(request: Request):
-    if request.headers.get("x-job-secret") != REMINDER_JOB_SECRET:
+    if not secret_ok(request.headers.get("x-job-secret"), REMINDER_JOB_SECRET):
         raise HTTPException(401, "Invalid job secret.")
 
     now = datetime.now(timezone.utc)
@@ -1850,7 +2816,7 @@ async def send_reminders(request: Request):
     return {"checked": len(due.data), "reminders_sent": sent}
 
 
-@app.post("/twilio/reminder-twiml/{appointment_id}")
+@app.post("/twilio/reminder-twiml/{appointment_id}", dependencies=[Depends(verify_twilio)])
 async def reminder_twiml(appointment_id: str):
     """Twilio fetches this when a reminder call connects (including to voicemail —
     Twilio still plays <Say> content even if a machine picks up)."""
@@ -1887,13 +2853,13 @@ NUMBER_POOL_TARGET_SIZE = int(os.environ.get("NUMBER_POOL_TARGET_SIZE", "3"))
 NUMBER_POOL_MIN_WARM_HOURS = int(os.environ.get("NUMBER_POOL_MIN_WARM_HOURS", "24"))
 POOL_JOB_SECRET = os.environ.get("POOL_JOB_SECRET")
 if not POOL_JOB_SECRET:
-    POOL_JOB_SECRET = secrets.token_hex(24)
+    POOL_JOB_SECRET = _derived_secret("pool-job")
     log.warning("POOL_JOB_SECRET not set — using a random per-restart value. Set it in Render.")
 
 
 @app.post("/internal/refill-number-pool")
 async def refill_number_pool(request: Request):
-    if request.headers.get("x-job-secret") != POOL_JOB_SECRET:
+    if not secret_ok(request.headers.get("x-job-secret"), POOL_JOB_SECRET):
         raise HTTPException(401, "Invalid job secret.")
     require_twilio()
 
@@ -1945,6 +2911,7 @@ def get_warmed_number():
     result = (
         sb.table("recall_number_pool").select("*")
         .is_("assigned_to_customer_id", "null")
+        .is_("assigned_at", "null")
         .lte("added_to_sender_pool_at", cutoff)
         .order("added_to_sender_pool_at")
         .limit(1)
@@ -2069,6 +3036,7 @@ async def setup_agent(
     customer = cust.data[0]
     if customer["tier"] not in ("pro", "elite"):
         raise HTTPException(403, "This account needs the Pro or Elite tier — upgrade to use the AI voice agent.")
+    require_active(customer_id)
     location = get_location_for_customer(customer_id, location_id)
 
     update = {"elevenlabs_voice_id": voice_id, "fallback_behavior": fallback_behavior}
@@ -2076,7 +3044,7 @@ async def setup_agent(
     # 1. Upload the PDF as a knowledge base document, if one was provided.
     kb_doc_id = location.get("elevenlabs_kb_doc_id")
     if pdf is not None:
-        files = {"file": (pdf.filename, await pdf.read(), pdf.content_type or "application/pdf")}
+        files = {"file": ((pdf.filename or "business-info.pdf")[:120], await _read_pdf_upload(pdf), "application/pdf")}
         resp = requests.post(
             f"{ELEVENLABS_BASE}/convai/knowledge-base/file",
             headers=el_headers(),
@@ -2589,6 +3557,7 @@ def google_auth_url(customer_id: str, service: str, location_id: str = None, aut
             "customer_id": customer_id,
             "location_id": location["id"],
             "service": service,
+            "typ": "oauth_state",
             "exp": datetime.now(timezone.utc) + timedelta(minutes=10),
         },
         JWT_SECRET,
@@ -2700,7 +3669,7 @@ SLOT_MINUTES = 30
 
 
 def check_tool_secret(request_headers: dict):
-    if request_headers.get("x-tool-secret") != ELEVENLABS_TOOL_SECRET:
+    if not secret_ok(request_headers.get("x-tool-secret"), ELEVENLABS_TOOL_SECRET):
         raise HTTPException(401, "Invalid tool secret.")
 
 
@@ -3232,9 +4201,11 @@ def _legal_page_shell(title: str, business_name: str, body_html: str) -> str:
 
 @app.get("/legal/sms-terms/{customer_id}", response_class=HTMLResponse)
 def sms_terms(customer_id: str):
+    import html as _html
     c = _get_customer_for_legal(customer_id)
-    business_name = c["business_name"]
-    contact = c.get("email") or c.get("business_phone") or "our office"
+    business_name = _html.escape(c["business_name"] or "")
+    contact = _html.escape(c.get("email") or c.get("business_phone") or "our office")
+    customer_id = _html.escape(customer_id)
     body = f"""
 <h1>SMS Terms &amp; Conditions</h1>
 <p class="updated">{business_name}</p>
@@ -3263,9 +4234,11 @@ def sms_terms(customer_id: str):
 
 @app.get("/legal/sms-privacy/{customer_id}", response_class=HTMLResponse)
 def sms_privacy(customer_id: str):
+    import html as _html
     c = _get_customer_for_legal(customer_id)
-    business_name = c["business_name"]
-    contact = c.get("email") or c.get("business_phone") or "our office"
+    business_name = _html.escape(c["business_name"] or "")
+    contact = _html.escape(c.get("email") or c.get("business_phone") or "our office")
+    customer_id = _html.escape(customer_id)
     body = f"""
 <h1>SMS Privacy Policy</h1>
 <p class="updated">{business_name}</p>
@@ -3538,6 +4511,11 @@ def _place_crm_call(customer_id: str, contact: dict, mode: str, message: str = N
         raise HTTPException(409, "This contact is marked Do Not Contact.")
     if mode not in ("ai_message", "connect"):
         raise HTTPException(422, "mode must be 'ai_message' or 'connect'.")
+    require_active(customer_id)
+    if not is_us_number(contact.get("phone") or ""):
+        raise HTTPException(422, "CallsKept can only call US phone numbers.")
+    if sends_today(customer_id, "call_out") >= int(app_setting("daily_call_cap", 100)):
+        raise HTTPException(429, "Daily call limit reached — calls resume tomorrow. Contact support@callskept.com to raise it.")
     try:
         loc = get_location_for_customer(customer_id, contact.get("location_id"))
     except HTTPException:
@@ -3604,7 +4582,7 @@ def crm_call(customer_id: str, contact_id: str, payload: CallCreate, authorizati
     return _place_crm_call(customer_id, contact, payload.mode, payload.message)
 
 
-@app.post("/twilio/crm-call/{activity_id}")
+@app.post("/twilio/crm-call/{activity_id}", dependencies=[Depends(verify_twilio)])
 async def crm_call_twiml(activity_id: str):
     vr = VoiceResponse()
     act = _call_activity(activity_id)
@@ -3638,7 +4616,7 @@ async def crm_call_twiml(activity_id: str):
     return PlainTextResponse(str(vr), media_type="application/xml")
 
 
-@app.post("/twilio/crm-call-gather/{activity_id}")
+@app.post("/twilio/crm-call-gather/{activity_id}", dependencies=[Depends(verify_twilio)])
 async def crm_call_gather(activity_id: str, request: Request):
     form = await request.form()
     vr = VoiceResponse()
@@ -3664,7 +4642,7 @@ async def crm_call_gather(activity_id: str, request: Request):
     return PlainTextResponse(str(vr), media_type="application/xml")
 
 
-@app.post("/twilio/crm-call-status/{activity_id}")
+@app.post("/twilio/crm-call-status/{activity_id}", dependencies=[Depends(verify_twilio)])
 async def crm_call_status(activity_id: str, request: Request):
     form = await request.form()
     act = _call_activity(activity_id)
@@ -4203,6 +5181,12 @@ async def run_followups(request: Request):
         out["voice_calls_synced"] = await run_in_threadpool(_sync_voice_calls, now, lookback)
     except Exception as e:
         log.error(f"Voice call sync failed: {e}")
+
+    # 5. Account follow-ups (unfinished checkout, no calls yet, win-back)
+    try:
+        out.update(await run_in_threadpool(run_lifecycle_followups, now))
+    except Exception as e:
+        log.error(f"Lifecycle follow-ups failed: {e}")
 
     if any(out.values()):
         log.info(f"run-followups: {out}")
