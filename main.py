@@ -398,6 +398,61 @@ def with_transfer_tool(existing, transfer_target: str) -> dict:
     return tools
 
 
+def _agent_has_transfer(agent_json: dict) -> bool:
+    prompt = ((agent_json or {}).get("conversation_config") or {}).get("agent", {}).get("prompt", {}) or {}
+    if (prompt.get("built_in_tools") or {}).get("transfer_to_number"):
+        return True
+    return any((t or {}).get("name") == "transfer_to_number" or
+               ((t or {}).get("params") or {}).get("system_tool_type") == "transfer_to_number"
+               for t in (prompt.get("tools") or []))
+
+
+def save_el_agent(agent_id: str, conversation_config: dict, name: str = None):
+    """Creates or updates an ElevenLabs agent and makes sure the transfer tool
+    actually sticks. ElevenLabs has stored system tools in two different
+    places over time (prompt.built_in_tools vs. the prompt.tools list), and a
+    save in the wrong shape is accepted but silently drops the tool — so try
+    the tools-list shape first, fall back to built_in_tools, and verify by
+    reading the agent back. Returns (response, agent_id)."""
+    import copy
+    prompt = conversation_config["agent"]["prompt"]
+    transfer = (prompt.get("built_in_tools") or {}).get("transfer_to_number")
+    variants = []
+    if transfer:
+        a = copy.deepcopy(conversation_config)
+        ap = a["agent"]["prompt"]
+        ap["tools"] = [t for t in (ap.get("tools") or []) if t.get("name") != "transfer_to_number"] + [copy.deepcopy(transfer)]
+        ap["built_in_tools"] = {k: v for k, v in (ap.get("built_in_tools") or {}).items() if k != "transfer_to_number"}
+        variants.append(("tools-list", a))
+    variants.append(("built_in_tools", conversation_config))
+    headers = {**el_headers(), "Content-Type": "application/json"}
+    resp = None
+    for label, cfg in variants:
+        if agent_id:
+            resp = requests.patch(f"{ELEVENLABS_BASE}/convai/agents/{agent_id}", headers=headers,
+                                  json={"conversation_config": cfg}, timeout=30)
+        else:
+            resp = requests.post(f"{ELEVENLABS_BASE}/convai/agents/create", headers=headers,
+                                 json={"name": name or "CallsKept agent", "conversation_config": cfg}, timeout=30)
+        if not resp.ok:
+            log.warning(f"Agent save ({label}) rejected: {resp.status_code} {resp.text[:200]}")
+            continue
+        if not agent_id:
+            agent_id = resp.json().get("agent_id")
+        if not transfer:
+            break
+        try:
+            check = requests.get(f"{ELEVENLABS_BASE}/convai/agents/{agent_id}", headers=el_headers(), timeout=20)
+            if check.ok and _agent_has_transfer(check.json()):
+                log.info(f"Agent {agent_id}: transfer tool saved ({label})")
+                break
+            log.warning(f"Agent {agent_id}: transfer tool didn't stick with {label} shape")
+        except Exception as e:
+            log.error(f"Couldn't verify transfer tool on agent {agent_id}: {e}")
+            break
+    return resp, agent_id
+
+
 CONFIRMATION_COOLDOWN = timedelta(minutes=10)
 
 
@@ -2205,30 +2260,14 @@ async def setup_agent(
     conversation_config["agent"]["prompt"]["built_in_tools"] = with_transfer_tool(
         conversation_config["agent"]["prompt"].get("built_in_tools"), transfer_target)
 
-    def save_agent(existing_agent_id):
-        if existing_agent_id:
-            r = requests.patch(
-                f"{ELEVENLABS_BASE}/convai/agents/{existing_agent_id}",
-                headers={**el_headers(), "Content-Type": "application/json"},
-                json={"conversation_config": conversation_config},
-                timeout=30,
-            )
-        else:
-            r = requests.post(
-                f"{ELEVENLABS_BASE}/convai/agents/create",
-                headers={**el_headers(), "Content-Type": "application/json"},
-                json={"name": f"{customer['business_name']} — {location.get('location_label', '')}".strip(" —"),
-                      "conversation_config": conversation_config},
-                timeout=30,
-            )
-        return r
-
     agent_id = location.get("elevenlabs_agent_id")
-    resp = save_agent(agent_id)
+    had_agent = bool(agent_id)
+    resp, agent_id = save_el_agent(
+        agent_id, conversation_config,
+        name=f"{customer['business_name']} — {location.get('location_label', '')}".strip(" —"))
     if not resp.ok:
         raise HTTPException(502, f"Couldn't save ElevenLabs agent: {resp.text[:300]}")
-    if not agent_id:
-        agent_id = resp.json().get("agent_id")
+    if not had_agent:
         update["elevenlabs_agent_id"] = agent_id
 
     # 3. Link the location's Twilio number to the agent in ElevenLabs.
@@ -2453,12 +2492,7 @@ def _resave_agent_for_location(customer: dict, location: dict) -> dict:
         conversation_config["agent"]["prompt"].get("built_in_tools"), transfer_target)
 
     try:
-        resp = requests.patch(
-            f"{ELEVENLABS_BASE}/convai/agents/{agent_id}",
-            headers={**el_headers(), "Content-Type": "application/json"},
-            json={"conversation_config": conversation_config},
-            timeout=30,
-        )
+        resp, _ = save_el_agent(agent_id, conversation_config)
         if not resp.ok:
             return {"location_id": location["id"], "agent_id": agent_id, "status": "failed", "detail": resp.text[:300]}
         return {"location_id": location["id"], "agent_id": agent_id, "status": "resaved"}
