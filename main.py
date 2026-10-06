@@ -21,6 +21,7 @@ from datetime import datetime, timezone, timedelta
 
 import jwt
 import requests
+from starlette.concurrency import run_in_threadpool
 from fastapi import FastAPI, Request, Form, HTTPException, Header, UploadFile, File, BackgroundTasks
 from fastapi.responses import PlainTextResponse, JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -437,7 +438,9 @@ def _merge_memory(business: str, current: str, new_info: str, source: str) -> st
                     "first (name, household members, vehicle/equipment, preferences), then visits and open "
                     "items with dates (YYYY-MM-DD), newest first; drop chit-chat and anything no longer true; "
                     "never include health or medical details, payment card numbers, account numbers, ID numbers "
-                    "or passwords. Output only the profile."
+                    "or passwords. If the new information has nothing worth remembering about this customer "
+                    "(small talk, a one-word reply, only questions about the business), output exactly NO_CHANGE. "
+                    "Otherwise output only the profile."
                 ),
                 "messages": [{"role": "user", "content":
                               f"Current profile:\n{(current or '(empty)').strip()}\n\n"
@@ -447,6 +450,8 @@ def _merge_memory(business: str, current: str, new_info: str, source: str) -> st
         )
         resp.raise_for_status()
         text = "".join(b.get("text", "") for b in resp.json().get("content", []) if b.get("type") == "text").strip()
+        if text.startswith("NO_CHANGE"):
+            return None
         return text[:MEMORY_MAX_CHARS] if text else fallback
     except Exception as e:
         log.error(f"Memory merge failed, appending instead: {e}")
@@ -475,10 +480,11 @@ def update_contact_memory(customer_id: str, phone: str = None, new_info: str = "
             return
         biz = (sb.table(TABLE_CUST).select("business_name").eq("id", customer_id).execute().data or [{}])[0].get("business_name") or "the business"
         merged = _merge_memory(biz, c.get("memory") or "", new_info, source)
-        upd = {"memory": merged, "memory_updated_at": datetime.now(timezone.utc).isoformat()}
+        upd = {"memory": merged, "memory_updated_at": datetime.now(timezone.utc).isoformat()} if merged else {}
         if name and not c.get("name"):
             upd["name"] = name.strip()[:120]
-        sb.table("recall_contacts").update(upd).eq("id", c["id"]).execute()
+        if upd:
+            sb.table("recall_contacts").update(upd).eq("id", c["id"]).execute()
     except Exception as e:
         log.error(f"update_contact_memory failed for customer {customer_id}: {e}")
 
@@ -1499,8 +1505,11 @@ async def twilio_sms(request: Request):
         for t in turns
     ]
 
+    sms_memory = {"saved": False}
+
     async def call_booking_tool(name: str, tool_input: dict) -> str:
         if name == "remember_caller":
+            sms_memory["saved"] = True
             import asyncio
             asyncio.get_running_loop().run_in_executor(
                 None, update_contact_memory, location["customer_id"], from_number,
@@ -1582,6 +1591,14 @@ async def twilio_sms(request: Request):
         }).execute()
     except Exception as e:
         log.error(f"SMS AI reply send failed for location {location['location_id']}: {e}")
+
+    # Backstop for memory: if the AI didn't save anything itself and the text
+    # has some substance, let the memory writer decide what's worth keeping.
+    if not sms_memory["saved"] and len((body or "").strip()) >= 15:
+        import asyncio
+        asyncio.get_running_loop().run_in_executor(
+            None, update_contact_memory, location["customer_id"], from_number,
+            f"They texted: \"{body.strip()[:800]}\"", "text message", None, None, location["location_id"])
 
     return PlainTextResponse("", media_type="application/xml")
 
@@ -3730,10 +3747,114 @@ async def elevenlabs_post_call(request: Request, background: BackgroundTasks):
         source="ai_call", location_id=location.get("location_id"), name=name,
         source_ref=f"el:{conv_id}" if conv_id else None,
     )
-    if summary and summary != "AI answered the call.":
-        background.add_task(update_contact_memory, location["customer_id"], caller,
-                            f"Phone call summary: {summary}", "phone call", name, None, location.get("location_id"))
+    if summary and summary != "AI answered the call." and not _call_already_remembered(location["customer_id"], conv_id):
+        background.add_task(_remember_voice_call, location["customer_id"], caller, conv_id, summary,
+                            data.get("transcript") or [], name, location.get("location_id"))
     return {"ok": True, "logged": True}
+
+
+# ---------------------------------------------------------------------------
+# VOICE-CALL MEMORY SYNC — the voice agent can't be trusted to call
+# remember_caller on its own, so after every finished call we read the
+# conversation from ElevenLabs and fold what the caller said into their
+# profile. Runs inside /internal/run-followups (every 5 min) and needs no
+# webhook setup; the post-call webhook above, if configured, does the same
+# thing sooner. Each conversation is processed once (memory_conv_ids).
+# ---------------------------------------------------------------------------
+VOICE_SYNC_LOOKBACK = timedelta(hours=6)
+
+
+def _call_already_remembered(customer_id: str, conv_id: str) -> bool:
+    if not conv_id:
+        return False
+    r = (sb.table("recall_contact_activities").select("id").eq("customer_id", customer_id)
+         .eq("type", "ai_call").eq("source_ref", f"el:{conv_id}")
+         .contains("metadata", {"memory_done": True}).limit(1).execute())
+    return bool(r.data)
+
+
+def _remember_voice_call(customer_id: str, caller: str, conv_id: str, summary: str,
+                         transcript: list, name: str = None, location_id: str = None):
+    """Builds the 'new information' from what the CALLER actually said (the
+    summary can contain the agent's own guesses) and merges it into memory."""
+    said = [str(t.get("message") or "").strip() for t in (transcript or [])
+            if t.get("role") == "user" and (t.get("message") or "").strip()]
+    if not said and not summary:
+        return
+    info = ""
+    if said:
+        info += "What the caller said on the phone today:\n" + "\n".join(f"- {s}" for s in said)[:2500] + "\n"
+    if summary:
+        info += f"Call summary (may include the receptionist's own words — trust the caller's lines above): {summary[:600]}"
+    update_contact_memory(customer_id, caller, info, "phone call", name, None, location_id)
+    try:
+        acts = (sb.table("recall_contact_activities").select("id, metadata").eq("customer_id", customer_id)
+                .eq("source_ref", f"el:{conv_id}").limit(1).execute()).data
+        if acts:
+            sb.table("recall_contact_activities").update(
+                {"metadata": {**(acts[0].get("metadata") or {}), "memory_done": True}}).eq("id", acts[0]["id"]).execute()
+    except Exception as e:
+        log.error(f"Couldn't mark call {conv_id} as remembered: {e}")
+
+
+def _sync_voice_calls(now: datetime, lookback: timedelta = VOICE_SYNC_LOOKBACK) -> int:
+    """Pulls recently finished AI-answered calls from ElevenLabs, logs each on
+    the caller's timeline and updates their memory. Returns calls processed."""
+    if not ELEVENLABS_API_KEY:
+        return 0
+    locs = (sb.table(TABLE_LOC).select("id, customer_id, elevenlabs_agent_id")
+            .not_.is_("elevenlabs_agent_id", "null").execute()).data or []
+    after = int((now - lookback).timestamp())
+    done = 0
+    for loc in locs:
+        try:
+            r = requests.get("https://api.elevenlabs.io/v1/convai/conversations", headers=el_headers(),
+                             params={"agent_id": loc["elevenlabs_agent_id"], "page_size": 30,
+                                     "call_start_after_unix": after}, timeout=15)
+            r.raise_for_status()
+            convs = [c for c in (r.json().get("conversations") or [])
+                     if c.get("status") == "done" and (c.get("message_count") or 0) >= 2]
+        except Exception as e:
+            log.error(f"Voice sync: couldn't list calls for location {loc['id']}: {e}")
+            continue
+        if not convs:
+            continue
+        refs = [f"el:{c['conversation_id']}" for c in convs]
+        seen = (sb.table("recall_contact_activities").select("source_ref, metadata")
+                .eq("customer_id", loc["customer_id"]).in_("source_ref", refs).execute()).data or []
+        finished = {s["source_ref"] for s in seen if (s.get("metadata") or {}).get("memory_done")}
+        for c in convs:
+            conv_id = c["conversation_id"]
+            if f"el:{conv_id}" in finished:
+                continue
+            try:
+                d = requests.get(f"https://api.elevenlabs.io/v1/convai/conversations/{conv_id}",
+                                 headers=el_headers(), timeout=15)
+                d.raise_for_status()
+                d = d.json()
+            except Exception as e:
+                log.error(f"Voice sync: couldn't read call {conv_id}: {e}")
+                continue
+            meta = d.get("metadata") or {}
+            pc = meta.get("phone_call") or {}
+            dyn = ((d.get("conversation_initiation_client_data") or {}).get("dynamic_variables")) or {}
+            caller = normalize_e164(pc.get("external_number") or dyn.get("system__caller_id") or d.get("user_id") or "")
+            if not caller:
+                continue  # web/test-widget call — no phone number to remember it under
+            analysis = d.get("analysis") or {}
+            summary = (analysis.get("transcript_summary") or "").strip()
+            started = meta.get("start_time_unix_secs") or c.get("start_time_unix_secs")
+            upsert_contact_and_log(
+                loc["customer_id"], caller, "ai_call", body=summary or "AI answered the call.",
+                metadata={"conversation_id": conv_id, "duration_secs": meta.get("call_duration_secs"),
+                          "call_successful": analysis.get("call_successful")},
+                source="ai_call", location_id=loc["id"], source_ref=f"el:{conv_id}",
+                created_at=datetime.fromtimestamp(started, timezone.utc).isoformat() if started else None,
+            )
+            _remember_voice_call(loc["customer_id"], caller, conv_id, summary,
+                                 d.get("transcript") or [], None, loc["id"])
+            done += 1
+    return done
 
 
 # ===========================================================================
@@ -3755,6 +3876,37 @@ def _job_secret() -> str:
         _job_secret_cache["value"] = sb.rpc("recall_job_secret", {}).execute().data
         _job_secret_cache["at"] = time.time()
     return _job_secret_cache["value"]
+
+
+TASK_RETRY_WINDOW = timedelta(hours=24)
+TASK_RETRY_EVERY = timedelta(minutes=30)
+
+
+_RETRY_MARK = " (first try "
+
+
+def _first_try_at(t: dict, now: datetime) -> datetime:
+    res = t.get("result") or ""
+    if _RETRY_MARK in res:
+        try:
+            return datetime.fromisoformat(res.split(_RETRY_MARK, 1)[1].rstrip(")"))
+        except ValueError:
+            pass
+    return now
+
+
+def _task_can_retry(t: dict, now: datetime) -> bool:
+    """Temporary failures (Twilio outage, network) are retried every 30
+    minutes for a day before the task is marked failed."""
+    return now - _first_try_at(t, now) < TASK_RETRY_WINDOW
+
+
+def _retry_task_later(t: dict, now: datetime, note: str):
+    first = _first_try_at(t, now)
+    sb.table("recall_tasks").update({
+        "executed_at": None, "due_at": (now + TASK_RETRY_EVERY).isoformat(),
+        "result": f"{note}{_RETRY_MARK}{first.isoformat()})",
+    }).eq("id", t["id"]).execute()
 
 
 def _location_sms_number(customer_id: str, contact: dict) -> dict:
@@ -3797,7 +3949,7 @@ async def run_followups(request: Request):
 
     now = datetime.now(timezone.utc)
     out = {"tasks_done": 0, "tasks_failed": 0, "tasks_waiting": 0, "auto_texts": 0, "auto_calls": 0, "auto_failed": 0,
-           "stalled_texts": 0, "stalled_calls": 0, "stalled_failed": 0}
+           "stalled_texts": 0, "stalled_calls": 0, "stalled_failed": 0, "voice_calls_synced": 0}
 
     # 1. Scheduled AI follow-ups
     due = (sb.table("recall_tasks").select("*, recall_contacts(*)")
@@ -3826,9 +3978,17 @@ async def run_followups(request: Request):
                 out["tasks_waiting"] += 1
                 continue
             status, result = "failed", str(e.detail)[:200]
+            if e.status_code >= 500 and _task_can_retry(t, now):
+                _retry_task_later(t, now, "Couldn't place the call yet — retrying")
+                out["tasks_waiting"] += 1
+                continue
         except Exception as e:
             log.error(f"Follow-up task {t['id']} failed: {e}")
             status, result = "failed", "Couldn't send — " + str(e)[:150]
+            if _task_can_retry(t, now):
+                _retry_task_later(t, now, "Couldn't send yet — retrying")
+                out["tasks_waiting"] += 1
+                continue
         sb.table("recall_tasks").update({
             "status": status, "result": result, "done_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", t["id"]).execute()
@@ -3861,6 +4021,12 @@ async def run_followups(request: Request):
         except Exception as e:
             log.error(f"Auto follow-up for contact {r['contact_id']} failed: {getattr(e, 'detail', e)}")
             out["auto_failed"] += 1
+            # A send that never went out doesn't count as a step: undo the
+            # counter so this step is retried on a run ~30 minutes from now.
+            try:
+                sb.table("recall_contacts").update({"auto_followups_sent": sent_before}).eq("id", r["contact_id"]).execute()
+            except Exception:
+                pass
     # 3. Stalled lead recovery
     try:
         stalled = sb.rpc("recall_crm_due_stalled", {}).execute().data or []
@@ -3886,6 +4052,20 @@ async def run_followups(request: Request):
         except Exception as e:
             log.error(f"Stalled-lead follow-up for {r['contact_id']} failed: {getattr(e, 'detail', e)}")
             out["stalled_failed"] += 1
+            # Didn't go out (e.g. Twilio down): give the attempt back. The
+            # claim timestamp stays, so it's retried in about an hour.
+            try:
+                sb.table("recall_contacts").update({"stall_attempts": max(0, int(r["attempt"]) - 1)}).eq("id", r["contact_id"]).execute()
+            except Exception:
+                pass
+
+    # 4. Remember what callers told the voice AI (see _sync_voice_calls)
+    try:
+        hours = request.query_params.get("voice_lookback_hours") or ""
+        lookback = timedelta(hours=int(hours)) if hours.isdigit() and 1 <= int(hours) <= 24 * 30 else VOICE_SYNC_LOOKBACK
+        out["voice_calls_synced"] = await run_in_threadpool(_sync_voice_calls, now, lookback)
+    except Exception as e:
+        log.error(f"Voice call sync failed: {e}")
 
     if any(out.values()):
         log.info(f"run-followups: {out}")
