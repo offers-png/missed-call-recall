@@ -438,8 +438,10 @@ def _merge_memory(business: str, current: str, new_info: str, source: str) -> st
                     "first (name, household members, vehicle/equipment, preferences), then visits and open "
                     "items with dates (YYYY-MM-DD), newest first; drop chit-chat and anything no longer true; "
                     "never include health or medical details, payment card numbers, account numbers, ID numbers "
-                    "or passwords. If the new information has nothing worth remembering about this customer "
-                    "(small talk, a one-word reply, only questions about the business), output exactly NO_CHANGE. "
+                    "or passwords. Also keep a short dated line for what they called or texted about when it was a "
+                    "real request (e.g. '- 2026-10-05: asked about AC tune-up pricing and after-hours service'), "
+                    "so staff can follow up. Only when the new information has nothing at all worth keeping "
+                    "(a greeting, a one-word reply, a hang-up, small talk), output exactly NO_CHANGE. "
                     "Otherwise output only the profile."
                 ),
                 "messages": [{"role": "user", "content":
