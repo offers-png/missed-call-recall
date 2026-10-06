@@ -374,6 +374,70 @@ def memory_tools(location_id: str, headers: dict) -> list:
     ]
 
 
+def with_transfer_tool(existing, transfer_target: str) -> dict:
+    """ElevenLabs' built-in 'Transfer to number' tool, pointed at the
+    location's transfer number. Without it the agent can only SAY it's
+    transferring. Other built-in tools already on the agent are kept."""
+    tools = dict(existing or {})
+    target = normalize_e164(transfer_target or "")
+    if not target:
+        tools.pop("transfer_to_number", None)
+        return tools
+    tools["transfer_to_number"] = {
+        "type": "system", "name": "transfer_to_number",
+        "description": "Connect the caller to a real person at the business.",
+        "params": {
+            "system_tool_type": "transfer_to_number",
+            "transfers": [{
+                "transfer_destination": {"type": "phone", "phone_number": target},
+                "condition": "The caller asks for a person, a manager or customer service, or has an emergency or urgent problem.",
+                "transfer_type": "conference",
+            }],
+        },
+    }
+    return tools
+
+
+CONFIRMATION_COOLDOWN = timedelta(minutes=10)
+
+
+def send_caller_confirmation(location: dict, caller_phone: str, note: str = "") -> bool:
+    """Texts the caller proof that their call/request reached the business.
+    At most one per caller every 10 minutes, and never to someone who opted
+    out (send_customer_sms checks). Never raises."""
+    try:
+        phone = normalize_e164(caller_phone or "")
+        if not phone or not location.get("twilio_number") or phone == normalize_e164(location["twilio_number"]):
+            return False
+        c = _contact_for_phone(location["customer_id"], phone)
+        if c:
+            since = (datetime.now(timezone.utc) - CONFIRMATION_COOLDOWN).isoformat()
+            recent = (sb.table("recall_contact_activities").select("id").eq("contact_id", c["id"])
+                      .eq("type", "sms_out").gt("created_at", since)
+                      .contains("metadata", {"kind": "caller_confirmation"}).limit(1).execute()).data
+            if recent:
+                return False
+        biz = location.get("business_name") or "us"
+        when = datetime.now(timezone.utc)
+        try:
+            from zoneinfo import ZoneInfo
+            when = when.astimezone(ZoneInfo(BUSINESS_TZ))
+        except Exception:
+            pass
+        stamp = when.strftime("%-I:%M %p on %b %-d")
+        body = f"Thanks for calling {biz}. We got your message at {stamp}"
+        note = (note or "").strip().rstrip(".")
+        if note:
+            body += f" ({note[:120]})"
+        body += ". The team has been notified and will call you back as soon as possible. You can reply to this text too."
+        return bool(send_customer_sms(location["customer_id"], phone, location["twilio_number"], body,
+                                      location_id=location.get("id") or location.get("location_id"),
+                                      kind="caller_confirmation"))
+    except Exception as e:
+        log.error(f"Caller confirmation text failed: {e}")
+        return False
+
+
 def _contact_for_phone(customer_id: str, phone: str) -> dict:
     p = normalize_e164(phone or "")
     if not p:
@@ -1972,7 +2036,10 @@ async def setup_agent(
             "'connecting you now', 'please hold', 'one moment', or 'you should be connected shortly' "
             "unless you have already called the transfer tool — if you catch yourself about to say "
             "any of those without having called it, call it first. Do not narrate a transfer that "
-            "hasn't actually happened."
+            "hasn't actually happened. If the transfer doesn't go through or the caller is still with you "
+            "after it, don't keep promising a transfer: call take_message with what they need, tell them "
+            "the team has been texted and that they'll get a confirmation text on their phone right away, "
+            "then offer to end the call."
         )
     calendar_connected = customer.get("tier") == "elite" and location.get("google_calendar_connected")
     if calendar_connected:
@@ -2135,6 +2202,9 @@ async def setup_agent(
         except Exception as e:
             log.error(f"Couldn't fetch existing agent config for {existing_agent_id}, built_in_tools may reset: {e}")
 
+    conversation_config["agent"]["prompt"]["built_in_tools"] = with_transfer_tool(
+        conversation_config["agent"]["prompt"].get("built_in_tools"), transfer_target)
+
     def save_agent(existing_agent_id):
         if existing_agent_id:
             r = requests.patch(
@@ -2238,7 +2308,10 @@ def _resave_agent_for_location(customer: dict, location: dict) -> dict:
             "'connecting you now', 'please hold', 'one moment', or 'you should be connected shortly' "
             "unless you have already called the transfer tool — if you catch yourself about to say "
             "any of those without having called it, call it first. Do not narrate a transfer that "
-            "hasn't actually happened."
+            "hasn't actually happened. If the transfer doesn't go through or the caller is still with you "
+            "after it, don't keep promising a transfer: call take_message with what they need, tell them "
+            "the team has been texted and that they'll get a confirmation text on their phone right away, "
+            "then offer to end the call."
         )
     calendar_connected = customer.get("tier") == "elite" and location.get("google_calendar_connected")
     if calendar_connected:
@@ -2375,6 +2448,9 @@ def _resave_agent_for_location(customer: dict, location: dict) -> dict:
                 conversation_config["agent"]["prompt"]["built_in_tools"] = existing_built_in_tools
     except Exception as e:
         log.error(f"Bulk resave: couldn't fetch existing built_in_tools for agent {agent_id}: {e}")
+
+    conversation_config["agent"]["prompt"]["built_in_tools"] = with_transfer_tool(
+        conversation_config["agent"]["prompt"].get("built_in_tools"), transfer_target)
 
     try:
         resp = requests.patch(
@@ -2852,7 +2928,8 @@ async def tool_notify_owner(location_id: str, request: Request):
 
     try:
         twilio_client.messages.create(to=target, from_=location["twilio_number"], body=message)
-        return {"result": "Notified. Proceed with the transfer."}
+        send_caller_confirmation(location, caller_phone, reason)
+        return {"result": "Notified, and the caller was texted a confirmation. Now call transfer_to_number to connect them."}
     except Exception as e:
         log.error(f"notify-owner SMS failed for location {location_id}: {e}")
         return {"result": "Notification failed to send — proceed with the transfer anyway."}
@@ -2908,7 +2985,10 @@ async def tool_take_message(location_id: str, request: Request):
         except Exception as e:
             log.error(f"take-message owner SMS failed for location {location_id}: {e}")
 
-    return {"result": "Logged. Let the caller know someone will follow up soon."}
+    texted = send_caller_confirmation(location, caller_phone, note)
+    if texted:
+        return {"result": "Logged, the team was texted, and a confirmation text was just sent to the caller's phone. Tell them to check their texts and that someone will call back soon."}
+    return {"result": "Logged and the team was notified. Let the caller know someone will follow up soon."}
 
 
 def _location_customer(location_id: str) -> str:
