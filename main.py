@@ -46,6 +46,9 @@ STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
 STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID")
 # Separate, higher-priced Stripe price for the Pro (AI voice) tier.
 STRIPE_PRICE_ID_PRO = os.environ.get("STRIPE_PRICE_ID_PRO")
+# Elite (AI voice + calendar booking + Google profile). Falls back to the Pro
+# price only if Elite's own price hasn't been added yet.
+STRIPE_PRICE_ID_ELITE = os.environ.get("STRIPE_PRICE_ID_ELITE")
 # ElevenLabs Conversational AI — powers the Pro tier's AI voice receptionist.
 ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
 # The LLM the AI voice agent runs on. ElevenLabs periodically deprecates
@@ -82,7 +85,23 @@ if not ELEVENLABS_TOOL_SECRET:
                 "then re-save any Elite customer's AI agent settings so the new secret takes effect.")
 
 stripe.api_key = STRIPE_SECRET_KEY  # fine if None — just can't call Stripe yet
-sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# The database client's default shared HTTP/2 connection breaks under
+# concurrent requests ("httpx.ReadError: [Errno 11] Resource temporarily
+# unavailable" → random 500s on dashboard pages). Plain HTTP/1.1 with a
+# connection pool is stable across threads.
+def _make_supabase() -> Client:
+    try:
+        import httpx
+        from supabase.lib.client_options import SyncClientOptions
+        http = httpx.Client(http2=False, timeout=30, follow_redirects=True,
+                            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20))
+        return create_client(SUPABASE_URL, SUPABASE_KEY, options=SyncClientOptions(httpx_client=http))
+    except Exception as e:
+        log.warning(f"Falling back to default Supabase client: {e}")
+        return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
+sb: Client = _make_supabase()
 twilio_client = TwilioClient(TWILIO_SID, TWILIO_TOKEN) if TWILIO_SID and TWILIO_TOKEN else None
 
 # Signs login tokens. Falls back to a random value so the app still boots,
@@ -816,9 +835,11 @@ async def signup(
     require_stripe()
     if tier not in ("basic", "pro", "elite"):
         raise HTTPException(400, "tier must be 'basic', 'pro', or 'elite'.")
-    price_id = STRIPE_PRICE_ID_PRO if tier in ("pro", "elite") else STRIPE_PRICE_ID
-    if tier in ("pro", "elite") and not price_id:
-        raise HTTPException(503, "This tier isn't configured yet — add STRIPE_PRICE_ID_PRO.")
+    price_id = {"basic": STRIPE_PRICE_ID, "pro": STRIPE_PRICE_ID_PRO,
+                "elite": STRIPE_PRICE_ID_ELITE or STRIPE_PRICE_ID_PRO}[tier]
+    if not price_id:
+        log.error(f"Signup blocked: no Stripe price configured for the {tier} plan")
+        raise HTTPException(503, "This plan isn't available right now — please try another plan or contact support@callskept.com.")
     if len(password) < 8:
         raise HTTPException(400, "Password must be at least 8 characters.")
     existing = sb.table(TABLE_CUST).select("id").eq("email", email).execute()
