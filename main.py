@@ -521,6 +521,29 @@ def upsert_contact_and_log(customer_id, phone, activity_type, body=None, metadat
         return None
 
 
+def texting_ready(from_number: str) -> bool:
+    """Carriers only deliver texts from numbers on an approved A2P campaign.
+    While approval is pending, app setting sms_live_numbers lists the numbers
+    that can text; when it's empty/unset every number is treated as live."""
+    live = app_setting("sms_live_numbers")
+    if not live:
+        return True
+    return normalize_e164(from_number or "") in {normalize_e164(n) for n in live}
+
+
+def _first_text_to(customer_id: str, phone: str) -> bool:
+    try:
+        c = sb.table("recall_contacts").select("id").eq("customer_id", customer_id) \
+            .eq("phone", normalize_e164(phone)).limit(1).execute().data
+        if not c:
+            return True
+        sent = sb.table("recall_contact_activities").select("id").eq("contact_id", c[0]["id"]) \
+            .eq("type", "sms_out").limit(1).execute().data
+        return not sent
+    except Exception:
+        return False
+
+
 def send_customer_sms(customer_id: str, to: str, from_: str, body: str,
                       location_id: str = None, kind: str = "manual", name: str = None):
     """The ONE outbound path for texts to a customer's contacts. Checks the
@@ -549,8 +572,14 @@ def send_customer_sms(customer_id: str, to: str, from_: str, body: str,
     if allowed is False:
         log.info(f"Blocked {kind} text to opted-out contact (customer {customer_id})")
         return None
+    if not texting_ready(from_):
+        log.info(f"Skipped {kind} text — {from_} is waiting for carrier texting approval")
+        return None
+    if "STOP" not in body.upper() and _first_text_to(customer_id, to):
+        body = body.rstrip() + " Reply STOP to opt out."  # carriers require it on the first text
 
-    sms = twilio_client.messages.create(to=to, from_=from_, body=body)
+    sms = twilio_client.messages.create(to=to, from_=from_, body=body,
+                                        status_callback=f"{PUBLIC_BASE_URL}/twilio/sms-status")
     upsert_contact_and_log(customer_id, to, "sms_out", body=body,
                            metadata={"kind": kind, "twilio_sid": sms.sid},
                            location_id=location_id, name=name, source_ref=f"tw:{sms.sid}")
@@ -1361,7 +1390,16 @@ def billing_overview(customer_id: str, authorization: str = Header(None)):
         "cancel_at_period_end": bool(c.get("cancel_at_period_end")),
         "has_subscription": bool(c.get("stripe_subscription_id")),
         "email": c.get("email"), "email_verified": bool(c.get("email_verified_at")),
+        "texting_ready": _account_texting_ready(customer_id),
     }
+
+
+def _account_texting_ready(customer_id: str) -> bool:
+    try:
+        loc = get_primary_location(customer_id)
+        return not loc.get("twilio_number") or texting_ready(loc["twilio_number"])
+    except Exception:
+        return True
 
 
 @app.post("/billing/{customer_id}/checkout")
@@ -1973,6 +2011,20 @@ async def send_missed_call_text(to_number: str, caller: str, call_sid: str):
         source_ref=f"call:{call_sid}" if call_sid else None,
     )
 
+    if not texting_ready(to_number):
+        # Texting from this number isn't carrier-approved yet: text the OWNER
+        # (from the approved CallsKept number) so they can call back right away.
+        owner_phone = location.get("transfer_phone") or location.get("business_phone")
+        if owner_phone and normalize_e164(owner_phone) != normalize_e164(caller):
+            send_platform_sms(owner_phone, f"CallsKept: missed call at {location['business_name']} from "
+                                           f"{_pretty_phone(caller)} — call them back. (Automatic text-back "
+                                           "turns on as soon as carriers approve your number.)")
+        call_row.update(sms_sent=False, sms_error="texting pending carrier approval — owner alerted")
+        try:
+            sb.table(TABLE_CALLS).insert(call_row).execute()
+        except Exception as e:
+            log.error(f"Couldn't save missed-call row for {call_sid}: {e}")
+        return
     try:
         sid = send_customer_sms(location["customer_id"], caller, to_number, message,
                                 location_id=location["location_id"], kind="missed_call_text")
@@ -2009,6 +2061,37 @@ async def twilio_dial_result(request: Request):
     resp.say("Sorry we missed you. We've just sent you a text — thanks for calling.")
     resp.hangup()
     return PlainTextResponse(str(resp), media_type="application/xml")
+
+
+CARRIER_BLOCK_CODES = {"30034", "30032", "30007", "30035", "30024"}
+
+
+@app.post("/twilio/sms-status", dependencies=[Depends(verify_twilio)])
+async def twilio_sms_status(request: Request):
+    """Delivery receipts for texts we send. Carrier blocks are recorded on the
+    message and the CallsKept owner is alerted (at most once a day per number)."""
+    form = await request.form()
+    status, code = form.get("MessageStatus"), str(form.get("ErrorCode") or "")
+    sid, from_ = form.get("MessageSid"), form.get("From")
+    if status in ("undelivered", "failed") and sid:
+        def _record():
+            try:
+                rows = sb.table("recall_contact_activities").select("id, metadata") \
+                    .eq("source_ref", f"tw:{sid}").limit(1).execute().data
+                if rows:
+                    meta = {**(rows[0].get("metadata") or {}), "delivery": status, "error_code": code}
+                    sb.table("recall_contact_activities").update({"metadata": meta}).eq("id", rows[0]["id"]).execute()
+            except Exception as e:
+                log.error(f"Couldn't record delivery status for {sid}: {e}")
+            if code in CARRIER_BLOCK_CODES:
+                try:
+                    rate_limit("carrier-block-alert", from_ or "", 1, 24 * 3600)
+                except HTTPException:
+                    return
+                alert_platform_owner(f"⚠️ CallsKept: carriers are blocking texts from {from_} (error {code}). "
+                                     "Check A2P registration / Messaging Service sender pool.")
+        await run_in_threadpool(_record)
+    return PlainTextResponse("", status_code=204)
 
 
 @app.post("/twilio/status", dependencies=[Depends(verify_twilio)])
@@ -2542,6 +2625,19 @@ async def twilio_sms(request: Request):
     # and logged it. Twilio sends the carrier-required confirmation itself, so
     # the AI must NOT reply to these.
     if sms_keyword(body) in OPT_OUT_WORDS | OPT_IN_WORDS:
+        return PlainTextResponse("", media_type="application/xml")
+
+    if not texting_ready(to_number):
+        # Can't reply from this number yet — pass the text to the owner instead.
+        owner_phone = location.get("transfer_phone") or location.get("business_phone")
+        if owner_phone and normalize_e164(owner_phone) != normalize_e164(from_number):
+            try:
+                rate_limit("fwd-text", f"{location['location_id']}:{from_number}", 5, 3600)
+                send_platform_sms(owner_phone, f"CallsKept: text to {location['business_name']} from "
+                                               f"{_pretty_phone(from_number)}: \"{body[:300]}\" — please call or "
+                                               "text them back from your phone.")
+            except HTTPException:
+                pass
         return PlainTextResponse("", media_type="application/xml")
 
     # Conversation history for THIS caller only. (Previously this pulled the
