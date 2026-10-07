@@ -89,6 +89,9 @@ if not ELEVENLABS_TOOL_SECRET:
                 "then re-save any Elite customer's AI agent settings so the new secret takes effect.")
 
 stripe.api_key = STRIPE_SECRET_KEY  # fine if None — just can't call Stripe yet
+if STRIPE_SECRET_KEY and not STRIPE_SECRET_KEY.startswith(("sk_", "rk_")):
+    log.error("STRIPE_SECRET_KEY is not a secret key (it should start with sk_test_ or sk_live_, "
+              "not pk_). Billing will fail until it's fixed in Render.")
 # The database client's default shared HTTP/2 connection breaks under
 # concurrent requests ("httpx.ReadError: [Errno 11] Resource temporarily
 # unavailable" → random 500s on dashboard pages). Plain HTTP/1.1 with a
@@ -361,6 +364,23 @@ def el_headers():
     return {"xi-api-key": ELEVENLABS_API_KEY}
 
 app = FastAPI(title="CallsKept - Missed Call Recovery")
+
+
+@app.exception_handler(stripe.error.StripeError)
+async def stripe_error_handler(request: Request, exc):
+    """Stripe problems come back as a readable message (with CORS headers, so the
+    page shows it) instead of a bare 500 that the browser reports as 'Failed to fetch'."""
+    log.error(f"Stripe error on {request.url.path}: {exc}")
+    msg = "Billing is temporarily unavailable — please try again in a few minutes."
+    if isinstance(exc, (stripe.error.PermissionError, stripe.error.AuthenticationError)):
+        msg = "Billing isn't set up correctly yet. We've been alerted — please try again shortly."
+        try:
+            alert_platform_owner(f"⚠️ CallsKept billing key problem: {str(exc)[:160]}")
+        except Exception:
+            pass
+    elif isinstance(exc, stripe.error.CardError):
+        msg = exc.user_message or "Your card was declined."
+    return JSONResponse({"detail": msg}, status_code=502)
 app.add_middleware(
     CORSMiddleware,
     # Only CallsKept's own site (and its Netlify previews) may call the API from a browser.
