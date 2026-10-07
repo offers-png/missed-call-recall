@@ -578,8 +578,12 @@ def send_customer_sms(customer_id: str, to: str, from_: str, body: str,
     if "STOP" not in body.upper() and _first_text_to(customer_id, to):
         body = body.rstrip() + " Reply STOP to opt out."  # carriers require it on the first text
 
-    sms = twilio_client.messages.create(to=to, from_=from_, body=body,
-                                        status_callback=f"{PUBLIC_BASE_URL}/twilio/sms-status")
+    try:
+        sms = twilio_client.messages.create(to=to, from_=from_, body=body,
+                                            status_callback=f"{PUBLIC_BASE_URL}/twilio/sms-status")
+    except Exception as e:
+        health_fail("twilio", f"A {kind.replace('_', ' ')} text didn't send: {str(e)[:160]}", customer_id)
+        raise
     upsert_contact_and_log(customer_id, to, "sms_out", body=body,
                            metadata={"kind": kind, "twilio_sid": sms.sid},
                            location_id=location_id, name=name, source_ref=f"tw:{sms.sid}")
@@ -853,6 +857,7 @@ def _merge_memory(business: str, current: str, new_info: str, source: str) -> st
         return text[:MEMORY_MAX_CHARS] if text else fallback
     except Exception as e:
         log.error(f"Memory merge failed, appending instead: {e}")
+        health_fail("anthropic", f"Caller memory update failed (saved the raw note instead): {str(e)[:150]}")
         return fallback
 
 
@@ -1654,6 +1659,7 @@ def send_platform_sms(to: str, body: str) -> bool:
         return True
     except Exception as e:
         log.error(f"Platform SMS to {to} failed: {e}")
+        health_fail("twilio", f"A CallsKept account/alert text didn't send: {str(e)[:160]}")
         return False
 
 
@@ -2185,8 +2191,12 @@ async def twilio_sms_status(request: Request):
     if status in ("undelivered", "failed") and sid:
         def _record():
             try:
-                rows = sb.table("recall_contact_activities").select("id, metadata") \
+                rows = sb.table("recall_contact_activities").select("id, customer_id, metadata") \
                     .eq("source_ref", f"tw:{sid}").limit(1).execute().data
+                # Account/sender errors mean our side is broken; others are usually a bad customer number.
+                health_fail("twilio" if code in TWILIO_ACCOUNT_ERROR_CODES else "delivery",
+                            f"A text wasn't delivered (Twilio error {code or status}).",
+                            rows[0]["customer_id"] if rows else None)
                 if rows:
                     meta = {**(rows[0].get("metadata") or {}), "delivery": status, "error_code": code}
                     sb.table("recall_contact_activities").update({"metadata": meta}).eq("id", rows[0]["id"]).execute()
@@ -2932,6 +2942,8 @@ async def twilio_sms(request: Request):
         reply_text = sms_plain(reply_text)
     except Exception as e:
         log.error(f"SMS AI failed for location {location['location_id']}: {e}")
+        health_fail("anthropic", f"AI text reply failed — sent the 'please call us' fallback: {str(e)[:150]}",
+                    location["customer_id"])
         reply_text = "Sorry, I'm having trouble answering right now — please call us directly."
 
     try:
@@ -4805,6 +4817,7 @@ def _place_crm_call(customer_id: str, contact: dict, mode: str, message: str = N
         )
     except Exception as e:
         log.error(f"CRM call failed for contact {contact['id']}: {e}")
+        health_fail("twilio", f"An outgoing call couldn't be placed: {str(e)[:160]}", customer_id)
         sb.table("recall_contact_activities").update({
             "metadata": {**meta, "call_status": "failed", "error": str(e)[:200]},
         }).eq("id", act["id"]).execute()
@@ -5177,6 +5190,8 @@ def _sync_voice_calls(now: datetime, lookback: timedelta = VOICE_SYNC_LOOKBACK) 
                      if c.get("status") == "done" and (c.get("message_count") or 0) >= 2]
         except Exception as e:
             log.error(f"Voice sync: couldn't list calls for location {loc['id']}: {e}")
+            health_fail("elevenlabs", f"Couldn't read AI call history from ElevenLabs: {str(e)[:150]}",
+                        loc["customer_id"])
             continue
         if not convs:
             continue
@@ -5436,6 +5451,12 @@ async def run_followups(request: Request):
 
     if any(out.values()):
         log.info(f"run-followups: {out}")
+
+    # 6. Health monitor (see HEALTH MONITOR at the end of this file) — last, so it sees this run's results
+    try:
+        await run_in_threadpool(run_health_check, now, dict(out))
+    except Exception as e:
+        log.error(f"Health check failed: {e}")
     return out
 
 
@@ -5567,6 +5588,8 @@ def _stalled_message(r: dict) -> str:
         return text[:limit] if len(text) >= 20 else fallback
     except Exception as e:
         log.error(f"Stalled message generation failed, using template: {e}")
+        health_fail("anthropic", f"AI follow-up writing failed (used the template): {str(e)[:150]}",
+                    r.get("customer_id"))
         return fallback
 
 
@@ -5704,3 +5727,490 @@ def save_roi_settings(customer_id: str, payload: RoiSettings, authorization: str
     if upd:
         sb.table(TABLE_CUST).update(upd).eq("id", customer_id).execute()
     return {"ok": True, **upd}
+
+
+# ===========================================================================
+# HEALTH MONITOR — owner-only status page (/admin/health) plus texts to the
+# owner when something breaks. Added after Oct 5–6 2026, when the Twilio
+# balance ran out overnight and every text/call failed silently.
+#
+#   * run_health_check() runs at the end of every /internal/run-followups
+#     (every 5 min), saves results to recall_health_state and alerts on change.
+#   * health_fail() is called wherever a send/AI call fails, so failures are
+#     counted in recall_health_events.
+#   * /health/watch is for an outside uptime monitor (UptimeRobot etc.): it
+#     returns 503 if the 5-minute job stopped running or anything is red, and
+#     texts the owner itself if the job went quiet.
+# Alerts: text on red, text on recovery, a reminder every hour while red,
+# and a summary at ~8am. Owner phone = app setting owner_alert_phone.
+# ===========================================================================
+HEALTH_LABEL = {
+    "server": "Server (Render)", "twilio": "Twilio (texts & calls)", "elevenlabs": "ElevenLabs (AI calls)",
+    "job": "5-minute background job", "anthropic": "Anthropic (AI replies & memory)", "supabase": "Database (Supabase)",
+    "delivery": "Text delivery",
+}
+HEALTH_ORDER = ("server", "twilio", "elevenlabs", "job", "anthropic", "supabase")
+HEALTH_WINDOW = timedelta(minutes=30)       # failures counted over this window
+HEALTH_RED_FAILURES = 3                     # this many failures in the window = red
+HEALTH_JOB_STALE = timedelta(minutes=15)
+HEALTH_REMIND_EVERY = timedelta(hours=1)
+HEALTH_AGENT_CHECK_EVERY = timedelta(hours=1)
+# Twilio delivery errors that mean OUR side is broken (account/sender), not a bad customer number.
+TWILIO_ACCOUNT_ERROR_CODES = CARRIER_BLOCK_CODES | {"30001", "30002"}
+_STARTED_AT = datetime.now(timezone.utc)
+_health_mem = {"supabase_alerted_at": None}  # used when the database itself is down
+
+
+def _owner_tz():
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(str(app_setting("owner_timezone", "America/New_York")))
+    except Exception:
+        return timezone(timedelta(hours=-4))
+
+
+def _ts(iso: str) -> datetime:
+    return datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+
+
+def health_fail(component: str, message: str, customer_id: str = None) -> None:
+    """Records a failure for the health page / alerts. Never raises."""
+    try:
+        sb.table("recall_health_events").insert({
+            "component": component, "customer_id": customer_id, "message": str(message)[:300],
+        }).execute()
+    except Exception as e:
+        log.error(f"Couldn't record health event ({component}): {e}")
+
+
+def _failure_status(component: str, now: datetime) -> tuple:
+    fails = (sb.table("recall_health_events").select("message, created_at")
+             .eq("component", component).gte("created_at", (now - HEALTH_WINDOW).isoformat())
+             .order("created_at", desc=True).limit(50).execute()).data or []
+    if len(fails) >= HEALTH_RED_FAILURES:
+        return "red", f"{len(fails)} failures in the last 30 minutes. Latest: {fails[0]['message']}"
+    if fails:
+        return "yellow", f"{len(fails)} failure(s) in the last 30 minutes. Latest: {fails[0]['message']}"
+    return "green", None
+
+
+def _check_twilio(now: datetime) -> tuple:
+    if twilio_client is None:
+        return "red", "Twilio isn't configured — TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN missing.", {}
+    data = {}
+    try:
+        acct = twilio_client.api.v2010.accounts(TWILIO_SID).fetch()
+    except Exception as e:
+        return "red", f"Can't reach the Twilio account: {str(e)[:150]}", {}
+    if acct.status != "active":
+        return "red", f"Twilio account is {acct.status} — texts and calls won't go out.", {}
+    try:
+        bal = twilio_client.api.v2010.accounts(TWILIO_SID).balance.fetch()
+        data["balance"] = round(float(bal.balance), 2)
+        data["currency"] = bal.currency
+    except Exception as e:
+        log.warning(f"Health: couldn't read Twilio balance: {e}")
+    low = float(app_setting("twilio_low_balance", 10))
+    if data.get("balance") is not None and data["balance"] < low:
+        return "red", (f"Twilio balance is ${data['balance']:.2f} (under ${low:.0f}). Top it up now — "
+                       "texts and calls stop at $0."), data
+    status, detail = _failure_status("twilio", now)
+    if status != "green":
+        return status, detail, data
+    bal_txt = f" Balance ${data['balance']:.2f}." if data.get("balance") is not None else ""
+    return "green", f"Account active.{bal_txt}", data
+
+
+def _check_elevenlabs(now: datetime, prev: dict) -> tuple:
+    if not ELEVENLABS_API_KEY:
+        return "red", "ElevenLabs isn't configured — ELEVENLABS_API_KEY missing.", {}
+    data = dict((prev or {}).get("data") or {})
+    try:
+        r = requests.get(f"{ELEVENLABS_BASE}/user/subscription", headers=el_headers(), timeout=15)
+        r.raise_for_status()
+        s = r.json()
+        used, limit = int(s.get("character_count") or 0), int(s.get("character_limit") or 0)
+        data.update(credits_used=used, credits_limit=limit,
+                    credits_left_pct=round(100 * (limit - used) / limit, 1) if limit else None,
+                    plan_status=s.get("status"))
+    except Exception as e:
+        return "red", f"Can't reach ElevenLabs: {str(e)[:150]}", data
+    # Agents: once an hour, make sure every location's agent still exists and,
+    # where the owner set a transfer number, still has the transfer tool.
+    last = data.get("agents_checked_at")
+    if not last or now - _ts(last) > HEALTH_AGENT_CHECK_EVERY:
+        problems = []
+        locs = (sb.table(TABLE_LOC).select("id, location_label, transfer_phone, elevenlabs_agent_id")
+                .not_.is_("elevenlabs_agent_id", "null").execute()).data or []
+        for loc in locs:
+            name = loc.get("location_label") or loc["id"]
+            try:
+                a = requests.get(f"{ELEVENLABS_BASE}/convai/agents/{loc['elevenlabs_agent_id']}",
+                                 headers=el_headers(), timeout=15)
+                if a.status_code == 404:
+                    problems.append(f"AI agent for {name} is missing")
+                    continue
+                a.raise_for_status()
+                if loc.get("transfer_phone") and not _agent_has_transfer(a.json()):
+                    problems.append(f"transfer tool is off for {name}")
+            except Exception as e:
+                problems.append(f"couldn't check agent for {name} ({str(e)[:60]})")
+        data.update(agents_checked_at=now.isoformat(), agents=len(locs), agent_problems=problems)
+    if data.get("plan_status") and data["plan_status"] not in ("active", "trialing", "free"):
+        return "red", f"ElevenLabs plan is {data['plan_status']} — AI calls may stop.", data
+    low = float(app_setting("elevenlabs_low_pct", 5))
+    if data.get("credits_left_pct") is not None and data["credits_left_pct"] < low:
+        return "red", (f"ElevenLabs credits are at {data['credits_left_pct']}% (under {low:.0f}%). "
+                       "Add credits or AI calls will stop."), data
+    if data.get("agent_problems"):
+        return "red", "AI agent problem: " + "; ".join(data["agent_problems"][:3]), data
+    status, detail = _failure_status("elevenlabs", now)
+    if status != "green":
+        return status, detail, data
+    pct = f"{data['credits_left_pct']}% credits left" if data.get("credits_left_pct") is not None else "credits unknown"
+    return "green", f"{data.get('agents', 0)} AI agent(s) OK, {pct}.", data
+
+
+def _check_job(job_out: dict) -> tuple:
+    failed = sum(int(job_out.get(k) or 0) for k in ("tasks_failed", "auto_failed", "stalled_failed"))
+    data = {"last_run": job_out}
+    if failed >= HEALTH_RED_FAILURES:
+        return "red", f"Ran, but {failed} follow-ups failed this run.", data
+    if failed:
+        return "yellow", f"Ran, {failed} follow-up(s) failed this run.", data
+    return "green", "Ran on schedule.", data
+
+
+def _check_anthropic(now: datetime) -> tuple:
+    if not ANTHROPIC_API_KEY:
+        return "red", "ANTHROPIC_API_KEY missing — AI text replies and caller memory are off.", {}
+    status, detail = _failure_status("anthropic", now)
+    return status, detail or "AI replies and memory writes working.", {}
+
+
+def _check_supabase() -> tuple:
+    t0 = time.time()
+    sb.table(TABLE_CUST).select("id").limit(1).execute()
+    ms = int((time.time() - t0) * 1000)
+    return ("yellow" if ms > 3000 else "green"), f"Reads/writes OK ({ms} ms).", {"read_ms": ms}
+
+
+def _fmt_duration(td: timedelta) -> str:
+    mins = int(td.total_seconds() // 60)
+    return f"{mins} min" if mins < 120 else f"{mins // 60} hr {mins % 60} min"
+
+
+def _save_health_and_alert(results: dict, prev: dict, now: datetime) -> None:
+    went_red, still_red, recovered = [], [], []
+    for comp, (status, detail, data) in results.items():
+        p = prev.get(comp) or {}
+        row = {"component": comp, "status": status, "detail": detail, "data": data or {},
+               "checked_at": now.isoformat(),
+               "changed_at": p.get("changed_at") if p.get("status") == status else now.isoformat(),
+               "alerted_at": p.get("alerted_at")}
+        was_red = p.get("status") == "red"
+        if status == "red" and not was_red:
+            went_red.append(f"{HEALTH_LABEL[comp]}: {detail}")
+            row["alerted_at"] = now.isoformat()
+        elif status == "red":
+            if not p.get("alerted_at") or now - _ts(p["alerted_at"]) >= HEALTH_REMIND_EVERY:
+                since = _ts(p["changed_at"]) if p.get("changed_at") else now
+                still_red.append(f"{HEALTH_LABEL[comp]} (down {_fmt_duration(now - since)}): {detail}")
+                row["alerted_at"] = now.isoformat()
+        elif was_red:
+            since = _ts(p["changed_at"]) if p.get("changed_at") else now
+            recovered.append(f"{HEALTH_LABEL[comp]} (was down {_fmt_duration(now - since)})")
+        sb.table("recall_health_state").upsert(row).execute()
+    page = f"{PUBLIC_BASE_URL}/admin/health"
+    if went_red:
+        alert_platform_owner("🔴 CallsKept problem — " + " | ".join(went_red)[:450] + f" {page}")
+    if still_red:
+        alert_platform_owner("🔴 Still broken — " + " | ".join(still_red)[:450] + f" {page}")
+    if recovered:
+        alert_platform_owner("✅ CallsKept working again: " + ", ".join(recovered))
+
+
+HEALTH_BLANK_COUNTS = {"calls": 0, "texts": 0, "ai": 0, "failures": 0}
+
+
+def _activity_counts(since: datetime, until: datetime = None) -> dict:
+    """Per-subscriber calls / texts / AI conversations / failures in a window."""
+    q = sb.table("recall_contact_activities").select("customer_id, type, metadata") \
+        .gte("created_at", since.isoformat())
+    if until:
+        q = q.lt("created_at", until.isoformat())
+    out = {}
+    for r in q.limit(20000).execute().data or []:
+        c = out.setdefault(r["customer_id"], dict(HEALTH_BLANK_COUNTS))
+        meta, t = r.get("metadata") or {}, r["type"]
+        if t in ("missed_call", "ai_call", "call_out"):
+            c["calls"] += 1
+        if t in ("sms_out", "sms_in"):
+            c["texts"] += 1
+        if t == "ai_call" or (t == "sms_out" and meta.get("kind") == "ai_sms_reply"):
+            c["ai"] += 1
+        if meta.get("call_status") == "failed":
+            c["failures"] += 1  # failed texts are counted from recall_health_events below
+    q = sb.table("recall_health_events").select("customer_id").gte("created_at", since.isoformat()) \
+        .not_.is_("customer_id", "null")
+    if until:
+        q = q.lt("created_at", until.isoformat())
+    for e in q.limit(5000).execute().data or []:
+        out.setdefault(e["customer_id"], dict(HEALTH_BLANK_COUNTS))["failures"] += 1
+    return out
+
+
+def _local_midnight(now: datetime, days_back: int = 0) -> datetime:
+    local = now.astimezone(_owner_tz())
+    midnight = local.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days_back)
+    return midnight.astimezone(timezone.utc)
+
+
+def _maybe_morning_summary(now: datetime, results: dict) -> None:
+    if not app_setting("owner_morning_summary", True):
+        return
+    local = now.astimezone(_owner_tz())
+    if local.hour < int(app_setting("owner_summary_hour", 8)):
+        return
+    today = local.date().isoformat()
+    st = (sb.table("recall_health_state").select("data").eq("component", "morning_summary").execute().data or [{}])[0]
+    if (st.get("data") or {}).get("sent_for") == today:
+        return
+    sb.table("recall_health_state").upsert({"component": "morning_summary", "status": "green",
+                                            "data": {"sent_for": today}, "checked_at": now.isoformat()}).execute()
+    counts = _activity_counts(_local_midnight(now, 1), _local_midnight(now))
+    tot = {k: sum(c[k] for c in counts.values()) for k in HEALTH_BLANK_COUNTS}
+    red = [HEALTH_LABEL[k] for k, v in results.items() if v[0] == "red"]
+    tw = results["twilio"][2] if "twilio" in results else {}
+    el = results["elevenlabs"][2] if "elevenlabs" in results else {}
+    parts = [f"☀️ CallsKept yesterday: {tot['calls']} calls, {tot['texts']} texts, {tot['ai']} AI chats, "
+             f"{tot['failures']} failures across {len(counts)} subscriber(s)."]
+    if tw.get("balance") is not None:
+        parts.append(f"Twilio ${tw['balance']:.2f}.")
+    if el.get("credits_left_pct") is not None:
+        parts.append(f"ElevenLabs {el['credits_left_pct']}% left.")
+    parts.append(("Problems now: " + ", ".join(red) + ".") if red else "Everything is green.")
+    alert_platform_owner(" ".join(parts))
+    # Housekeeping, once a day: keep 30 days of failure history.
+    try:
+        sb.table("recall_health_events").delete().lt("created_at", (now - timedelta(days=30)).isoformat()).execute()
+    except Exception as e:
+        log.error(f"Health event cleanup failed: {e}")
+
+
+def run_health_check(now: datetime, job_out: dict) -> dict:
+    """Runs every check, saves results, and alerts the owner on changes."""
+    try:
+        supabase_result = _check_supabase()
+        prev = {r["component"]: r for r in (sb.table("recall_health_state").select("*").execute().data or [])}
+    except Exception as e:
+        # Database down: nothing below can run or be saved. Text directly
+        # (owner phone from the last cached settings), at most once an hour.
+        log.error(f"Health: Supabase check failed: {e}")
+        last = _health_mem["supabase_alerted_at"]
+        if not last or now - last >= HEALTH_REMIND_EVERY:
+            _health_mem["supabase_alerted_at"] = now
+            phone = _settings_cache["values"].get("owner_alert_phone")
+            if phone:
+                send_platform_sms(str(phone), f"🔴 CallsKept problem — the database (Supabase) isn't answering: "
+                                              f"{str(e)[:150]}")
+        return {"supabase": "red"}
+    if _health_mem["supabase_alerted_at"]:
+        _health_mem["supabase_alerted_at"] = None
+        alert_platform_owner("✅ CallsKept working again: Database (Supabase)")
+    results = {"supabase": supabase_result,
+               "server": ("green", f"Running — up {_fmt_duration(now - _STARTED_AT)} since the last restart.", {}),
+               "job": _check_job(job_out)}
+    for comp, fn in (("twilio", lambda: _check_twilio(now)),
+                     ("elevenlabs", lambda: _check_elevenlabs(now, prev.get("elevenlabs"))),
+                     ("anthropic", lambda: _check_anthropic(now))):
+        try:
+            results[comp] = fn()
+        except Exception as e:
+            log.error(f"Health check {comp} crashed: {e}")
+            results[comp] = ("yellow", f"The health check itself failed: {str(e)[:150]}", {})
+    _save_health_and_alert(results, prev, now)
+    try:
+        _maybe_morning_summary(now, results)
+    except Exception as e:
+        log.error(f"Morning summary failed: {e}")
+    return {k: v[0] for k, v in results.items()}
+
+
+def _job_is_stale(now: datetime) -> Optional[timedelta]:
+    row = (sb.table("recall_health_state").select("checked_at").eq("component", "job").execute().data or [{}])[0]
+    if not row.get("checked_at"):
+        return None  # never ran yet (fresh install) — don't cry wolf
+    age = now - _ts(row["checked_at"])
+    return age if age > HEALTH_JOB_STALE else None
+
+
+@app.get("/health/watch")
+def health_watch():
+    """For an outside uptime monitor. 200 = all good; 503 = something's red or
+    the 5-minute job stopped. Gives no details (it's public)."""
+    now = datetime.now(timezone.utc)
+    try:
+        stale = _job_is_stale(now)
+        red = sb.table("recall_health_state").select("component").eq("status", "red").execute().data or []
+    except Exception:
+        return JSONResponse({"ok": False}, status_code=503)
+    if stale:
+        # The job is what normally sends alerts, so alert from here instead (once an hour).
+        try:
+            rate_limit("health-job-stale", "owner", 1, 3600)
+            alert_platform_owner(f"🔴 CallsKept problem — the 5-minute background job hasn't run for "
+                                 f"{_fmt_duration(stale)}. Follow-ups, stalled leads and AI call memory are paused, "
+                                 "and other alerts can't fire. Check the Supabase pg_cron job and the Render logs.")
+        except HTTPException:
+            pass
+    ok = not stale and not red
+    return JSONResponse({"ok": ok}, status_code=200 if ok else 503)
+
+
+@app.get("/admin/health/data")
+def admin_health_data(authorization: str = Header(None)):
+    require_admin(authorization)
+    now = datetime.now(timezone.utc)
+    state = {r["component"]: r for r in (sb.table("recall_health_state").select("*").execute().data or [])}
+    stale = _job_is_stale(now)
+    if stale:
+        state["job"] = {**state.get("job", {}), "status": "red",
+                        "detail": f"Hasn't run for {_fmt_duration(stale)} — nothing is being checked or followed up."}
+    checks = [{"component": c, "label": HEALTH_LABEL[c],
+               **{k: (state.get(c) or {}).get(k) for k in ("status", "detail", "data", "checked_at", "changed_at")}}
+              for c in HEALTH_ORDER]
+    customers = (sb.table(TABLE_CUST).select("id, business_name, status, tier")
+                 .in_("status", ["trial", "active", "past_due"]).execute()).data or []
+    counts = _activity_counts(_local_midnight(now))
+    subs = sorted(({"id": c["id"], "business_name": c.get("business_name"), "status": c.get("status"),
+                    "tier": c.get("tier"), **counts.get(c["id"], HEALTH_BLANK_COUNTS)} for c in customers),
+                  key=lambda s: (-s["failures"], (s["business_name"] or "").lower()))
+    names = {c["id"]: c.get("business_name") for c in customers}
+    events = (sb.table("recall_health_events").select("created_at, component, customer_id, message")
+              .order("created_at", desc=True).limit(25).execute()).data or []
+    for e in events:
+        e["business_name"] = names.get(e.get("customer_id"))
+        e["label"] = HEALTH_LABEL.get(e["component"], e["component"].title())
+    totals = {k: sum(s[k] for s in subs) for k in HEALTH_BLANK_COUNTS}
+    return {"now": now.isoformat(), "checks": checks, "totals": totals, "subscribers": subs, "events": events}
+
+
+@app.post("/admin/health/run")
+async def admin_health_run(authorization: str = Header(None)):
+    """Runs the health checks now (not the follow-up jobs). Alerts still apply."""
+    require_admin(authorization)
+    now = datetime.now(timezone.utc)
+    prev = (sb.table("recall_health_state").select("data").eq("component", "job").execute().data or [{}])[0]
+    return await run_in_threadpool(run_health_check, now, (prev.get("data") or {}).get("last_run") or {})
+
+
+@app.get("/admin/health", response_class=HTMLResponse)
+def admin_health_page():
+    # Static shell only — all data comes from /admin/health/data with the admin key.
+    return HTMLResponse(ADMIN_HEALTH_HTML, headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex"})
+
+
+ADMIN_HEALTH_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex"><title>CallsKept Health</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--ink:#14171c;--mute:#5f6b7a;--line:#e3e6ea;--g:#16a34a;--y:#ca8a04;--r:#dc2626}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1216;--card:#171b21;--ink:#e8ebef;--mute:#98a2b0;--line:#2a3039}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+main{max-width:1000px;margin:0 auto;padding:20px 16px 60px}h1{font-size:22px;margin:0}h2{font-size:16px;margin:28px 0 10px}
+.top{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.mute{color:var(--mute);font-size:13px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.row{display:flex;gap:12px;padding:12px 14px;border-top:1px solid var(--line);align-items:flex-start}.row:first-child{border-top:0}
+.dot{width:12px;height:12px;border-radius:50%;margin-top:5px;flex:none;background:var(--mute)}
+.dot.green{background:var(--g)}.dot.yellow{background:var(--y)}.dot.red{background:var(--r)}
+.row b{display:block}.tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+.tile{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px}.tile .n{font-size:26px;font-weight:650}
+@media (max-width:600px){.tiles{grid-template-columns:repeat(2,1fr)}}
+.tw{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{padding:9px 12px;text-align:left;border-top:1px solid var(--line);white-space:nowrap}
+th{font-weight:600;color:var(--mute);border-top:0}.num{text-align:right}.bad{color:var(--r);font-weight:650}
+button{font:inherit;padding:8px 14px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--ink);cursor:pointer}
+input{font:inherit;padding:9px 12px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--ink);width:100%;max-width:360px}
+#login{max-width:420px;margin:15vh auto;padding:0 16px}#err{color:var(--r);margin-top:10px}
+</style></head><body>
+<div id="login" hidden><h1>CallsKept Health</h1><p class="mute">Owner only. Enter your admin key.</p>
+<form id="lf"><input id="key" type="password" autocomplete="current-password" placeholder="Admin key"><p><button>Open</button></p></form>
+<div id="err"></div></div>
+<main id="app" hidden>
+<div class="top"><div><h1>CallsKept Health</h1><div class="mute" id="when"></div></div>
+<div><button id="run">Check now</button> <button id="out">Log out</button></div></div>
+<h2>Systems</h2><div class="card" id="checks"></div>
+<h2>Today</h2><div class="tiles" id="totals"></div>
+<h2>Subscribers today</h2><div class="card tw"><table><thead><tr><th>Business</th><th>Status</th>
+<th class="num">Calls</th><th class="num">Texts</th><th class="num">AI chats</th><th class="num">Failures</th></tr></thead>
+<tbody id="subs"></tbody></table></div>
+<h2>Recent errors</h2><div class="card" id="events"></div>
+</main>
+<script>
+const K = 'ck_admin_key';
+let key = '';
+try { key = sessionStorage.getItem(K) || ''; } catch (e) {}
+const $ = id => document.getElementById(id);
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+function ago(iso) {
+  if (!iso) return 'never';
+  const s = (Date.now() - new Date(iso)) / 1000;
+  if (s < 90) return 'just now';
+  if (s < 5400) return Math.round(s / 60) + ' min ago';
+  if (s < 172800) return Math.round(s / 3600) + ' hr ago';
+  return new Date(iso).toLocaleString();
+}
+function showLogin(msg) { $('app').hidden = true; $('login').hidden = false; $('err').textContent = msg || ''; }
+async function load() {
+  let r;
+  try { r = await fetch('/admin/health/data', { headers: { Authorization: 'Bearer ' + key } }); }
+  catch (e) { $('when').textContent = 'Server unreachable. Retrying every minute.'; return; }
+  if (r.status === 401) { try { sessionStorage.removeItem(K); } catch (e) {} showLogin(key ? "That key didn't work." : ''); key = ''; return; }
+  if (!r.ok) { $('when').textContent = "Couldn't load (" + r.status + '). Retrying every minute.'; return; }
+  const d = await r.json();
+  $('login').hidden = true; $('app').hidden = false;
+  $('when').textContent = 'Updated ' + new Date(d.now).toLocaleTimeString() + ' · refreshes every minute';
+  const c = $('checks'); c.replaceChildren();
+  d.checks.forEach(x => {
+    const row = el('div', 'row'); row.append(el('span', 'dot ' + (x.status || '')));
+    const t = el('div');
+    t.append(el('b', null, x.label));
+    t.append(el('div', null, x.detail || 'Not checked yet. Waits for the next 5-minute run.'));
+    t.append(el('div', 'mute', 'Checked ' + ago(x.checked_at) + (x.changed_at && x.status && x.status !== 'green' ? ' · since ' + ago(x.changed_at) : '')));
+    row.append(t); c.append(row);
+  });
+  const tt = $('totals'); tt.replaceChildren();
+  [['Calls', d.totals.calls], ['Texts', d.totals.texts], ['AI chats', d.totals.ai], ['Failures', d.totals.failures]].forEach(([l, n]) => {
+    const t = el('div', 'tile'); t.append(el('div', 'mute', l)); t.append(el('div', 'n' + (l === 'Failures' && n ? ' bad' : ''), String(n))); tt.append(t);
+  });
+  const sb = $('subs'); sb.replaceChildren();
+  if (!d.subscribers.length) { const tr = el('tr'); const td = el('td', 'mute', 'No active subscribers yet.'); td.colSpan = 6; tr.append(td); sb.append(tr); }
+  d.subscribers.forEach(s => {
+    const tr = el('tr');
+    tr.append(el('td', null, s.business_name || '(no name)'));
+    tr.append(el('td', null, (s.status || '') + (s.tier ? ' · ' + s.tier : '')));
+    ['calls', 'texts', 'ai'].forEach(k => tr.append(el('td', 'num', String(s[k]))));
+    tr.append(el('td', 'num' + (s.failures ? ' bad' : ''), String(s.failures)));
+    sb.append(tr);
+  });
+  const ev = $('events'); ev.replaceChildren();
+  if (!d.events.length) ev.append(el('div', 'row mute', 'No errors recorded.'));
+  d.events.forEach(e => {
+    const row = el('div', 'row'); const t = el('div');
+    t.append(el('b', null, e.label + (e.business_name ? ' · ' + e.business_name : '')));
+    t.append(el('div', null, e.message || ''));
+    t.append(el('div', 'mute', ago(e.created_at)));
+    row.append(t); ev.append(row);
+  });
+}
+$('lf').onsubmit = e => { e.preventDefault(); key = $('key').value.trim(); try { sessionStorage.setItem(K, key); } catch (x) {} load(); };
+$('out').onclick = () => { key = ''; try { sessionStorage.removeItem(K); } catch (e) {} showLogin(); };
+$('run').onclick = async () => {
+  $('run').disabled = true; $('run').textContent = 'Checking…';
+  try { await fetch('/admin/health/run', { method: 'POST', headers: { Authorization: 'Bearer ' + key } }); }
+  finally { $('run').disabled = false; $('run').textContent = 'Check now'; load(); }
+};
+if (key) load(); else showLogin();
+setInterval(() => { if (key) load(); }, 60000);
+</script></body></html>"""

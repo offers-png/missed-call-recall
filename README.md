@@ -66,3 +66,19 @@ Fixes the two things that killed the last version:
 - Real auth on the dashboard (currently the customer_id in the URL is the
   only gate — fine for a handful of pilot customers, not for scale).
 - Email/SMS reminder on `trial_will_end`.
+
+## Health monitor (owner only)
+- **Page:** `https://<render-url>/admin/health` (asks for `ADMIN_SECRET`). Shows each
+  system green/yellow/red, today's totals, per-subscriber calls/texts/AI chats/failures,
+  and recent errors in plain words.
+- **Checks** run at the end of every 5-minute `/internal/run-followups`: Twilio account +
+  balance, ElevenLabs credits + agents/transfer tool (hourly), Anthropic and send failures
+  (3 in 30 min = red), Supabase read speed, and the job itself.
+- **Alerts** go to app setting `owner_alert_phone` (and `owner_alert_email` if set): text
+  on red, on recovery, a reminder every hour while red, and a summary around 8am
+  (`owner_morning_summary`, `owner_summary_hour`, `owner_timezone`). Thresholds:
+  `twilio_low_balance` (default 10), `elevenlabs_low_pct` (default 5).
+- **Uptime monitor:** point UptimeRobot (or similar) at `GET /health/watch` every 5 min.
+  It returns 503 if anything is red or the 5-minute job hasn't run for 15 min, so you
+  still hear about it when the server itself is down.
+- **Database:** run `sql/health_monitor.sql` once.
