@@ -461,6 +461,20 @@ OPT_OUT_WORDS = {"STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"}
 OPT_IN_WORDS = {"START", "UNSTOP"}
 
 
+def sms_plain(text: str, limit: int = 480) -> str:
+    """Phones show markdown literally (**bold**), so AI replies are flattened to
+    plain text and kept to about three SMS segments."""
+    t = re.sub(r"\*\*(.+?)\*\*|__(.+?)__", lambda m: m.group(1) or m.group(2), text or "")
+    t = re.sub(r"(?m)^[ \t]{0,3}#{1,6}[ \t]*", "", t)
+    t = re.sub(r"`+", "", t)
+    t = re.sub(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])", r"\1", t)
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    if len(t) > limit:
+        cut = t[:limit].rsplit(" ", 1)[0].rstrip(",;:—- ")
+        t = cut + "…"
+    return t
+
+
 def sms_keyword(body: str) -> str:
     return re.sub(r"[^A-Za-z]", "", body or "").upper()
 
@@ -1065,6 +1079,12 @@ def _new_checkout_session(customer: dict) -> str:
     if not price_id:
         raise HTTPException(503, "This plan isn't available right now — please pick another plan or contact support@callskept.com.")
     stripe_customer_id = customer.get("stripe_customer_id")
+    if stripe_customer_id:
+        try:
+            if stripe.Customer.retrieve(stripe_customer_id).get("deleted"):
+                stripe_customer_id = None
+        except stripe.error.InvalidRequestError:
+            stripe_customer_id = None  # e.g. a test-mode customer after switching to live keys
     if not stripe_customer_id:
         stripe_customer_id = stripe.Customer.create(
             email=customer["email"], name=customer.get("business_name"),
@@ -2704,6 +2724,7 @@ async def twilio_sms(request: Request):
 
         if not reply_text:
             reply_text = "Got it — let me know if there's anything else I can help with."
+        reply_text = sms_plain(reply_text)
     except Exception as e:
         log.error(f"SMS AI failed for location {location['location_id']}: {e}")
         reply_text = "Sorry, I'm having trouble answering right now — please call us directly."
