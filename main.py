@@ -1592,11 +1592,28 @@ def _email_html(heading: str, text: str, button_text: str = None, button_url: st
             f'<p style="max-width:560px;margin:14px auto 0;font-size:12px;color:#6b7280;text-align:center">{foot}</p></div>')
 
 
+MARKETING_KINDS = {"broadcast", "winback", "checkout_reminder", "onboarding"}
+
+
 def send_email(to: str, subject: str, text: str, *, kind: str = "notice", customer_id: str = None,
                button_text: str = None, button_url: str = None, footer: str = None) -> bool:
-    """Sends one email. Never raises — a failed email must not break signup or billing."""
+    """Sends one email. Never raises — a failed email must not break signup or billing.
+    Non-essential emails (MARKETING_KINDS) carry an unsubscribe link + List-Unsubscribe
+    header and are skipped for anyone who unsubscribed."""
     if not to:
         return False
+    headers = {}
+    if kind in MARKETING_KINDS and customer_id:
+        try:
+            row = (sb.table(TABLE_CUST).select("marketing_opt_out").eq("id", customer_id).limit(1).execute().data or [{}])[0]
+            if row.get("marketing_opt_out"):
+                return False
+        except Exception:
+            pass
+        unsub = f"{PUBLIC_BASE_URL}/email/unsubscribe?token=" + make_purpose_token(customer_id, "unsubscribe", 60 * 24 * 365)
+        footer = f"Don't want these emails? Unsubscribe: {unsub}"
+        text = text + f"\n\n—\nUnsubscribe: {unsub}"
+        headers = {"List-Unsubscribe": f"<{unsub}>", "List-Unsubscribe-Post": "List-Unsubscribe=One-Click"}
     body_text = text + (f"\n\n{button_text}: {button_url}" if button_url else "")
     row = {"customer_id": customer_id, "to_email": to, "kind": kind, "subject": subject}
     if not RESEND_API_KEY:
@@ -1608,6 +1625,7 @@ def send_email(to: str, subject: str, text: str, *, kind: str = "notice", custom
             r = requests.post("https://api.resend.com/emails", timeout=15,
                               headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
                               json={"from": EMAIL_FROM, "to": [to], "subject": subject, "reply_to": EMAIL_REPLY_TO,
+                                    **({"headers": headers} if headers else {}),
                                     "text": body_text,
                                     "html": _email_html(subject, text, button_text, button_url, footer)})
             if r.status_code >= 300:
@@ -1700,7 +1718,9 @@ def send_welcome(customer: dict, number: str, business_phone: str = None) -> Non
                  "We'll text you as soon as it's ready.")
     text = (f"Welcome to CallsKept, {customer.get('owner_name') or customer.get('business_name')}!\n\n"
             f"Your 7-day free trial of the {PLAN_NAMES.get(tier, tier.title())} plan has started. "
-            "You won't be charged until it ends, and you can change plans or cancel anytime in Plans & billing.\n\n"
+            f"When it ends, your subscription renews automatically every month at ${PLAN_PRICES.get(tier, '')}/month "
+            "(plus any tax) on the card you added, until you cancel. You can cancel online anytime in Plans & billing — "
+            "cancel before the trial ends and you won't be charged.\n\n"
             + steps + "\n\nQuestions? Just reply to this email.")
     send_email(customer.get("email"), "Welcome to CallsKept — your number is ready" if number else "Welcome to CallsKept",
                text, kind="welcome", customer_id=customer["id"], button_text="Open my dashboard", button_url=dash)
@@ -1802,6 +1822,92 @@ def reset_password(body: ResetIn, request: Request):
 
 
 # ---------------------------------------------------------------------------
+# YOUR DATA — download everything, or delete the account for good.
+# ---------------------------------------------------------------------------
+EXPORT_SECRET_FIELDS = {"password_hash", "google_calendar_refresh_token", "google_business_refresh_token",
+                        "checkout_session_id", "account_pin", "ein"}
+
+
+def _clean(rows):
+    return [{k: v for k, v in (r or {}).items() if k not in EXPORT_SECRET_FIELDS} for r in (rows or [])]
+
+
+@app.get("/account/{customer_id}/export")
+def export_account(customer_id: str, authorization: str = Header(None)):
+    require_auth(customer_id, authorization)
+    rate_limit("export", customer_id, 5, 3600)
+    out = {"exported_at": datetime.now(timezone.utc).isoformat(), "account": _clean([_customer_or_404(customer_id)])[0]}
+    for key, table in [("locations", TABLE_LOC), ("contacts", "recall_contacts"),
+                       ("timeline", "recall_contact_activities"), ("tasks", "recall_tasks"),
+                       ("text_messages", "recall_sms_messages"), ("missed_calls", TABLE_CALLS),
+                       ("appointments", "recall_appointments"), ("messages_taken", "recall_messages"),
+                       ("feedback", "recall_feedback")]:
+        try:
+            out[key] = _clean(sb.table(table).select("*").eq("customer_id", customer_id).limit(20000).execute().data)
+        except Exception as e:
+            out[key] = {"error": f"couldn't export: {str(e)[:80]}"}
+    return JSONResponse(out, headers={"Content-Disposition": 'attachment; filename="callskept-data.json"',
+                                      "Cache-Control": "no-store"})
+
+
+class DeleteIn(BaseModel):
+    password: str
+    confirm: str
+
+
+@app.post("/account/{customer_id}/delete")
+def delete_account(customer_id: str, body: DeleteIn, authorization: str = Header(None)):
+    """Permanently deletes the account: stops billing, turns off the AI voice,
+    releases the phone numbers, and removes all contacts, messages and history.
+    Stripe keeps its own invoice records, as tax law requires."""
+    require_auth(customer_id, authorization)
+    rate_limit("delete-account", customer_id, 5, 3600)
+    if (body.confirm or "").strip().upper() != "DELETE":
+        raise HTTPException(400, 'Type DELETE to confirm.')
+    c = _customer_or_404(customer_id)
+    if not verify_password(body.password or "", c.get("password_hash") or ""):
+        raise HTTPException(403, "That password isn't right.")
+    problems = []
+    if c.get("stripe_subscription_id") and STRIPE_SECRET_KEY:
+        try:
+            stripe.Subscription.cancel(c["stripe_subscription_id"])
+        except Exception as e:
+            if "No such subscription" not in str(e) and "canceled" not in str(e):
+                problems.append(f"stripe: {e}")
+    for loc in sb.table(TABLE_LOC).select("*").eq("customer_id", customer_id).execute().data or []:
+        try:
+            _detach_voice(loc)
+        except Exception as e:
+            problems.append(f"voice {loc['id']}: {e}")
+        if loc.get("elevenlabs_agent_id") and ELEVENLABS_API_KEY:
+            try:
+                requests.delete(f"{ELEVENLABS_BASE}/convai/agents/{loc['elevenlabs_agent_id']}", headers=el_headers(), timeout=30)
+            except Exception as e:
+                problems.append(f"agent {loc['id']}: {e}")
+        if loc.get("twilio_number") and loc["twilio_number"] != "claiming" and twilio_client:
+            try:
+                for n in twilio_client.incoming_phone_numbers.list(phone_number=loc["twilio_number"], limit=1):
+                    n.delete()
+            except Exception as e:
+                problems.append(f"number {loc['twilio_number']}: {e}")
+    try:
+        sb.table("recall_number_pool").delete().eq("assigned_to_customer_id", customer_id).execute()
+        sb.table(TABLE_CUST).delete().eq("id", customer_id).execute()  # cascades to all account data
+    except Exception as e:
+        log.error(f"Account deletion failed for {customer_id}: {e}")
+        alert_platform_owner(f"⚠️ CallsKept: account deletion for {c.get('email')} failed — finish it by hand. {str(e)[:120]}")
+        raise HTTPException(500, "We couldn't finish deleting your account — our team has been alerted and will complete it within 24 hours.")
+    _PWD_CHANGED_CACHE.pop(customer_id, None)
+    send_email(c.get("email"), "Your CallsKept account has been deleted",
+               "Your CallsKept account and all of its contacts, messages and call history have been permanently deleted, "
+               "your subscription has been canceled, and your CallsKept phone number has been released.\n\n"
+               "Past invoices stay with our payment processor (Stripe) as required for tax records.")
+    alert_platform_owner(f"CallsKept account deleted by owner: {c.get('business_name')} ({c.get('email')})"
+                         + (f" — check: {'; '.join(problems)[:200]}" if problems else ""))
+    return {"ok": True, "deleted": True}
+
+
+# ---------------------------------------------------------------------------
 # FEEDBACK — in-app "Send feedback" box. Stored, and the owner gets a text.
 # ---------------------------------------------------------------------------
 class FeedbackIn(BaseModel):
@@ -1858,10 +1964,15 @@ def admin_broadcast(body: BroadcastIn, authorization: str = Header(None)):
         return {"would_send": len(targets), "emails": [t["email"] for t in targets][:200]}
     sent = 0
     for t in targets[:1000]:
-        unsub = make_purpose_token(t["id"], "unsubscribe", 60 * 24 * 365)
-        sent += send_email(t["email"], body.subject[:150], body.message[:5000], kind="broadcast", customer_id=t["id"],
-                           footer=f"Don't want product news? Unsubscribe: {PUBLIC_BASE_URL}/email/unsubscribe?token={unsub}")
+        sent += send_email(t["email"], body.subject[:150], body.message[:5000], kind="broadcast", customer_id=t["id"])
     return {"sent": sent, "targets": len(targets)}
+
+
+@app.post("/email/unsubscribe")
+def email_unsubscribe_post(token: str):
+    p = read_purpose_token(token, "unsubscribe")
+    sb.table(TABLE_CUST).update({"marketing_opt_out": True}).eq("id", p["customer_id"]).execute()
+    return {"ok": True}
 
 
 @app.get("/email/unsubscribe", response_class=HTMLResponse)
@@ -1921,14 +2032,12 @@ def run_lifecycle_followups(now: datetime) -> dict:
             .gte("updated_at", (now - timedelta(days=60)).isoformat()).limit(25).execute()).data
     for c in rows:
         sb.table(TABLE_CUST).update({"winback_sent_at": now.isoformat()}).eq("id", c["id"]).execute()
-        unsub = make_purpose_token(c["id"], "unsubscribe", 60 * 24 * 365)
         send_email(c["email"], "Your CallsKept contacts are still saved",
                    "Since you left, missed calls aren't getting a text back. Your contacts, notes and settings are still "
                    "saved — restart anytime and everything picks up where it left off.\n\nIf something didn't work for you, "
                    "just reply and tell us. We read every reply.",
                    kind="winback", customer_id=c["id"], button_text="Restart CallsKept",
-                   button_url=f"{FRONTEND_BASE_URL}/plans.html?customer_id={c['id']}",
-                   footer=f"Don't want these? Unsubscribe: {PUBLIC_BASE_URL}/email/unsubscribe?token={unsub}")
+                   button_url=f"{FRONTEND_BASE_URL}/plans.html?customer_id={c['id']}")
         out["winbacks"] += 1
     return out
 
@@ -2277,7 +2386,7 @@ def change_password(
     if not cust.data or not cust.data[0].get("password_hash"):
         raise HTTPException(404, "Not found")
     if not verify_password(current_password, cust.data[0]["password_hash"]):
-        raise HTTPException(401, "Your current password is incorrect.")
+        raise HTTPException(403, "Your current password is incorrect.")
     sb.table(TABLE_CUST).update({"password_hash": hash_password(new_password),
                                  "password_changed_at": datetime.now(timezone.utc).isoformat()}).eq("id", customer_id).execute()
     _PWD_CHANGED_CACHE.pop(customer_id, None)
