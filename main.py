@@ -2241,7 +2241,8 @@ async def twilio_dial_result(request: Request):
 
     await send_missed_call_text(to_number, caller, call_sid)
 
-    resp.say("Sorry we missed you. We've just sent you a text — thanks for calling.")
+    resp.say("Sorry we missed your call. We've just sent a text message to this number so you can reach us by text. "
+             "Message and data rates may apply. Reply STOP to opt out at any time. Thanks for calling.")
     resp.hangup()
     return PlainTextResponse(str(resp), media_type="application/xml")
 
