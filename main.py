@@ -1915,6 +1915,73 @@ def delete_account(customer_id: str, body: DeleteIn, authorization: str = Header
 
 
 # ---------------------------------------------------------------------------
+# LIVE DEMO — visitors talk to a sample AI receptionist right in the browser.
+# Uses its own ElevenLabs agent (a made-up plumbing company, no real tools),
+# created on first use. Signed URLs keep the agent private; calls are capped
+# at 3 minutes, 3 tries per visitor per hour and a daily total.
+# ---------------------------------------------------------------------------
+DEMO_VOICE_ID = "EXAVITQu4vr4xnSDxMaL"
+DEMO_PROMPT = """You are Riley, the friendly AI receptionist for Brightside Plumbing & Heating, a small local plumbing and heating company. This is a live demo on the CallsKept website: the person talking to you is a business owner trying out what a CallsKept AI receptionist sounds like. Treat them like a real caller unless they ask about the demo.
+
+Business info (sample):
+- Hours: Monday to Friday 7 AM to 6 PM, Saturday 8 AM to 2 PM, closed Sunday. 24/7 emergency line for burst pipes, no heat, and gas smells.
+- Services: leaks and burst pipes, clogged drains, water heaters (repair and install), furnaces and boilers, new fixtures, sump pumps, yearly heating tune-ups.
+- Pricing: service call $89, waived if you go ahead with the repair. Heating tune-up $129. Water heater installs start around $1,400; we give free written quotes.
+- Service area: the city and about 20 miles around it.
+
+How to handle calls:
+- Keep answers short and natural, like a real receptionist on the phone. One or two sentences at a time.
+- Find out what they need, their name, and a good callback number. Repeat key details back.
+- If they want an appointment, offer two realistic time slots (for example tomorrow 9 to 11 AM or 1 to 3 PM) and confirm one. Say they'll get a text confirmation.
+- If they want a person, or it's an emergency, say you're connecting them now. Then explain: "In this demo I can't transfer, but for a real business I'd connect you to the owner's phone right now."
+- If you don't know something, say you'll have the owner call them back — never make up facts beyond the info above.
+- If they ask how this works or what CallsKept is: CallsKept answers calls a business misses, texts the caller back, books appointments, transfers to the owner when needed, and remembers returning callers. Plans start with a 7-day free trial at callskept.com. Don't be pushy.
+- Never ask for payment card numbers, social security numbers or other sensitive details.
+- Wrap up politely when they're done."""
+
+
+def _demo_agent_id() -> str:
+    aid = app_setting("demo_agent_id")
+    if aid:
+        return aid
+    cfg = {
+        "agent": {"first_message": "Hi, thanks for calling Brightside Plumbing and Heating, this is Riley! How can I help you today?",
+                  "language": "en",
+                  "prompt": {"prompt": DEMO_PROMPT, "llm": ELEVENLABS_LLM_MODEL, "temperature": 0.5}},
+        "tts": {"voice_id": DEMO_VOICE_ID},
+        "conversation": {"max_duration_seconds": 180},
+    }
+    r = requests.post(f"{ELEVENLABS_BASE}/convai/agents/create", headers={**el_headers(), "Content-Type": "application/json"},
+                      json={"name": "CallsKept website demo (Brightside Plumbing)", "conversation_config": cfg}, timeout=30)
+    if not r.ok:
+        log.error(f"Demo agent create failed: {r.status_code} {r.text[:300]}")
+        raise HTTPException(503, "The live demo is warming up — please try again in a minute.")
+    aid = r.json().get("agent_id")
+    sb.table("recall_app_settings").upsert({"key": "demo_agent_id", "value": aid,
+                                            "updated_at": datetime.now(timezone.utc).isoformat()}).execute()
+    _settings_cache["at"] = 0
+    return aid
+
+
+@app.post("/demo/voice-session")
+def demo_voice_session(request: Request):
+    require_elevenlabs()
+    if app_setting("demo_enabled", True) is False:
+        raise HTTPException(503, "The live demo is paused right now — start a free trial to try it on your own number.")
+    rate_limit("demo-ip", client_ip(request), 3, 3600,
+               "You've tried the live demo a few times — start a free trial to keep testing it on your own number.")
+    rate_limit("demo-day", "all", int(app_setting("demo_daily_cap", 60)), 24 * 3600,
+               "The live demo is very busy today — please try again tomorrow or start a free trial.")
+    aid = _demo_agent_id()
+    r = requests.get(f"{ELEVENLABS_BASE}/convai/conversation/get-signed-url", params={"agent_id": aid},
+                     headers=el_headers(), timeout=15)
+    if not r.ok or not r.json().get("signed_url"):
+        log.error(f"Demo signed URL failed: {r.status_code} {r.text[:200]}")
+        raise HTTPException(503, "The live demo isn't available right now — please try again shortly.")
+    return {"signed_url": r.json()["signed_url"]}
+
+
+# ---------------------------------------------------------------------------
 # FEEDBACK — in-app "Send feedback" box. Stored, and the owner gets a text.
 # ---------------------------------------------------------------------------
 class FeedbackIn(BaseModel):
