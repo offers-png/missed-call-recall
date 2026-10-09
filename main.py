@@ -501,6 +501,30 @@ def normalize_e164(raw: str) -> str:
     return None
 
 
+_OWN_NUMBERS_CACHE: dict = {}
+
+
+def _is_own_number(customer_id: str, phone: str) -> bool:
+    """True when `phone` is one of this account's own CallsKept numbers, e.g. a
+    test call from the CallsKept number to itself.
+    Cached 5 minutes; fails open (returns False) so logging never breaks."""
+    try:
+        p = normalize_e164(phone or "")
+        if not p:
+            return False
+        hit = _OWN_NUMBERS_CACHE.get(customer_id)
+        if not hit or hit[1] < time.time():
+            rows = (sb.table(TABLE_LOC).select("twilio_number")
+                    .eq("customer_id", customer_id).execute().data) or []
+            nums = {normalize_e164(r.get("twilio_number") or "") for r in rows}
+            nums.discard(None)
+            hit = (nums, time.time() + 300)
+            _OWN_NUMBERS_CACHE[customer_id] = hit
+        return p in hit[0]
+    except Exception:
+        return False
+
+
 def upsert_contact_and_log(customer_id, phone, activity_type, body=None, metadata=None,
                            source=None, location_id=None, name=None, source_ref=None,
                            created_at=None):
@@ -509,6 +533,8 @@ def upsert_contact_and_log(customer_id, phone, activity_type, body=None, metadat
     call/SMS handling."""
     if not customer_id or not phone:
         return None
+    if _is_own_number(customer_id, phone):
+        return None  # the business's own CallsKept/business line is never a "caller"
     try:
         r = sb.rpc("recall_crm_log_event", {
             "p_customer_id": customer_id,
@@ -4745,6 +4771,169 @@ def crm_update_contact(customer_id: str, contact_id: str, payload: ContactPatch,
                             f"Job completed and paid: ${float(r.data['job_value']):,.2f}.", "owner update",
                             None, contact_id)
     return r.data
+
+
+@app.delete("/crm/{customer_id}/contacts/{contact_id}")
+def crm_delete_contact(customer_id: str, contact_id: str, authorization: str = Header(None)):
+    """Permanently deletes a contact with its timeline, tasks and AI memory.
+    If the same number calls again later, they start fresh as a new contact."""
+    require_auth(customer_id, authorization)
+    _get_contact_or_404(customer_id, contact_id)
+    try:
+        sb.table("recall_tasks").delete().eq("contact_id", contact_id).eq("customer_id", customer_id).execute()
+        sb.table("recall_contact_activities").delete().eq("contact_id", contact_id).eq("customer_id", customer_id).execute()
+        sb.table("recall_contacts").delete().eq("id", contact_id).eq("customer_id", customer_id).execute()
+    except Exception:
+        log.exception(f"Contact delete failed for {contact_id}")
+        raise HTTPException(500, "Couldn't delete that contact — please try again.")
+    return {"deleted": True, "contact_id": contact_id}
+
+
+@app.delete("/crm/{customer_id}/contacts/{contact_id}/memory")
+def crm_clear_memory(customer_id: str, contact_id: str, authorization: str = Header(None)):
+    """Wipes what the AI remembers about this caller. Call history stays."""
+    require_auth(customer_id, authorization)
+    _get_contact_or_404(customer_id, contact_id)
+    sb.table("recall_contacts").update({
+        "memory": None, "memory_updated_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", contact_id).eq("customer_id", customer_id).execute()
+    return _get_contact_or_404(customer_id, contact_id)
+
+
+def _fetch_call_transcript(conversation_id: str) -> list:
+    """Full AI-call transcript from ElevenLabs as [{who, text, at_secs}]."""
+    if not conversation_id or not ELEVENLABS_API_KEY or not re.fullmatch(r"[A-Za-z0-9_\-]{6,80}", conversation_id):
+        return []
+    try:
+        d = requests.get(f"https://api.elevenlabs.io/v1/convai/conversations/{conversation_id}",
+                         headers=el_headers(), timeout=15)
+        d.raise_for_status()
+        turns = []
+        for t in d.json().get("transcript") or []:
+            text = str(t.get("message") or "").strip()
+            if not text:
+                continue
+            turns.append({"who": "AI receptionist" if t.get("role") == "agent" else "Caller",
+                          "text": text, "at_secs": t.get("time_in_call_secs")})
+        return turns
+    except Exception as e:
+        log.error(f"Transcript fetch failed for {conversation_id}: {e}")
+        return []
+
+
+@app.get("/crm/{customer_id}/contacts/{contact_id}/calls/{activity_id}/transcript")
+def crm_call_transcript(customer_id: str, contact_id: str, activity_id: str, authorization: str = Header(None)):
+    """Word-for-word transcript of one AI-answered call on this contact."""
+    require_auth(customer_id, authorization)
+    _get_contact_or_404(customer_id, contact_id)
+    _require_uuid(activity_id, "Call not found")
+    act = (sb.table("recall_contact_activities").select("id, type, body, metadata, created_at")
+           .eq("id", activity_id).eq("contact_id", contact_id).eq("customer_id", customer_id)
+           .limit(1).execute().data)
+    if not act:
+        raise HTTPException(404, "Call not found")
+    act = act[0]
+    conv_id = (act.get("metadata") or {}).get("conversation_id")
+    if not conv_id:
+        raise HTTPException(404, "There's no recording transcript for this entry.")
+    turns = _fetch_call_transcript(conv_id)
+    if not turns:
+        raise HTTPException(502, "Couldn't load the transcript right now — please try again in a minute.")
+    return {"activity_id": activity_id, "summary": act.get("body"), "created_at": act.get("created_at"),
+            "duration_secs": (act.get("metadata") or {}).get("duration_secs"), "transcript": turns}
+
+
+ACTIVITY_LABELS = {
+    "ai_call": "AI answered call", "missed_call": "Missed call", "call_in": "Incoming call",
+    "call_out": "Call from you", "sms_in": "Text from caller", "sms_out": "Text sent",
+    "note": "Note", "quote": "Quote", "status_change": "Status changed",
+}
+
+
+def _pdf_safe(text) -> str:
+    """Core PDF fonts are Latin-1 only; swap common Unicode punctuation and drop the rest."""
+    s = str(text or "")
+    for a, b in (("—", "-"), ("–", "-"), ("‘", "'"), ("’", "'"), ("“", '"'),
+                 ("”", '"'), ("…", "..."), (" ", " "), ("•", "-"), ("→", "->")):
+        s = s.replace(a, b)
+    return s.encode("latin-1", "ignore").decode("latin-1")
+
+
+def _fmt_when(iso: str) -> str:
+    try:
+        from zoneinfo import ZoneInfo
+        dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00")).astimezone(ZoneInfo(BUSINESS_TZ))
+        return dt.strftime("%b %d, %Y %I:%M %p %Z").replace(" 0", " ")
+    except Exception:
+        return str(iso or "")
+
+
+@app.get("/crm/{customer_id}/contacts/{contact_id}/export.pdf")
+def crm_export_contact_pdf(customer_id: str, contact_id: str, transcripts: bool = True,
+                           authorization: str = Header(None)):
+    """Downloadable PDF of everything on one contact: details, AI memory, and the
+    full call/text history, with word-for-word AI call transcripts."""
+    from fastapi.responses import Response
+    from fpdf import FPDF
+
+    require_auth(customer_id, authorization)
+    contact = _get_contact_or_404(customer_id, contact_id)
+    acts = (sb.table("recall_contact_activities").select("id, type, body, metadata, created_at")
+            .eq("contact_id", contact_id).eq("customer_id", customer_id)
+            .order("created_at", desc=False).limit(500).execute().data) or []
+    biz = (sb.table(TABLE_CUST).select("business_name").eq("id", customer_id).execute().data or [{}])[0].get("business_name") or ""
+
+    pdf = FPDF(format="Letter")
+    pdf.set_auto_page_break(True, margin=18)
+    pdf.set_margins(18, 18, 18)
+    pdf.add_page()
+    w = pdf.w - pdf.l_margin - pdf.r_margin
+
+    def line(text, size=10, style="", color=(30, 30, 30), gap=1.5):
+        pdf.set_font("Helvetica", style, size)
+        pdf.set_text_color(*color)
+        pdf.multi_cell(w, size * 0.5, _pdf_safe(text), new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(gap)
+
+    line("CallsKept - Caller record", 9, "B", (20, 110, 90), 0.5)
+    line(contact.get("name") or contact.get("phone") or "Caller", 18, "B", gap=1)
+    line(" | ".join(x for x in [contact.get("phone"), contact.get("email"), biz] if x), 10, color=(90, 90, 90))
+    line(f"Status: {(contact.get('status') or 'new').replace('_', ' ').title()}"
+         + (f"   Job value: ${float(contact['job_value']):,.2f}" if contact.get("job_value") is not None else "")
+         + f"   Exported: {_fmt_when(datetime.now(timezone.utc).isoformat())}", 9, color=(90, 90, 90), gap=4)
+
+    if (contact.get("memory") or "").strip():
+        line("What the AI remembers", 12, "B", gap=1)
+        line(contact["memory"].strip(), 10, gap=4)
+
+    line(f"History ({len(acts)} entries)", 12, "B", gap=2)
+    if not acts:
+        line("No calls or texts yet.", 10, color=(90, 90, 90))
+    transcripts_left = 25  # cap ElevenLabs lookups per export
+    for a in acts:
+        label = ACTIVITY_LABELS.get(a["type"], a["type"].replace("_", " ").capitalize())
+        meta = a.get("metadata") or {}
+        dur = meta.get("duration_secs")
+        head = f"{_fmt_when(a['created_at'])}  -  {label}" + (f" ({int(dur)//60}m {int(dur)%60}s)" if dur else "")
+        pdf.set_draw_color(225, 225, 225)
+        pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + w, pdf.get_y())
+        pdf.ln(2)
+        line(head, 9, "B", (60, 60, 60), 0.5)
+        if a.get("body"):
+            line(a["body"], 10, gap=1.5)
+        if transcripts and a["type"] == "ai_call" and meta.get("conversation_id") and transcripts_left > 0:
+            transcripts_left -= 1
+            turns = _fetch_call_transcript(meta["conversation_id"])
+            if turns:
+                line("Transcript", 9, "B", (20, 110, 90), 0.5)
+                for t in turns:
+                    line(f"{t['who']}: {t['text']}", 9, color=(40, 40, 40), gap=0.8)
+        pdf.ln(2)
+
+    data = bytes(pdf.output())
+    safe = re.sub(r"[^A-Za-z0-9]+", "-", contact.get("name") or contact.get("phone") or "caller").strip("-") or "caller"
+    return Response(content=data, media_type="application/pdf",
+                    headers={"Content-Disposition": f'attachment; filename="callskept-{safe}.pdf"'})
 
 
 class SmsCreate(BaseModel):
